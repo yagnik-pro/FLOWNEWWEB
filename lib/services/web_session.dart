@@ -83,6 +83,14 @@ class WebSession {
     );
   }
 
+  /// Header values Meesho's API accepts for `client-type`. The panel sends one
+  /// of these on every XHR — without it the API answers
+  /// `400 {"message":"Bad Request. Invalid client type."}`.
+  static const _clientTypes = ['web', 'supplier-web', 'supplier', 'android'];
+
+  /// Remembered once we learn which value this account's API accepts.
+  static String? goodClientType;
+
   /// Calls a Meesho API path from inside the hidden WebView, with [cookies]
   /// installed for the duration. Tries the request shapes Meesho is known to
   /// accept and returns the first decoded JSON body that comes back 200.
@@ -103,18 +111,34 @@ class WebSession {
         await Future.delayed(const Duration(milliseconds: 1800));
       }
 
-      final attempts = <String, String>{
-        if (body != null) 'POST+body': _fetchJs(path, 'POST', jsonEncode(body)),
-        'POST+empty': _fetchJs(path, 'POST', '{}'),
-        'GET': _fetchJs(path, 'GET', null),
-      };
+      // Put the value that already worked first so later calls are single-shot.
+      final types = <String>[
+        if (goodClientType != null) goodClientType!,
+        ..._clientTypes.where((t) => t != goodClientType),
+      ];
+
+      final attempts = <String, List<String>>{};
+      for (final t in types) {
+        if (body != null) {
+          attempts['POST body ct=$t'] = [t, 'POST', jsonEncode(body)];
+        }
+        attempts['POST empty ct=$t'] = [t, 'POST', '{}'];
+      }
+      for (final t in types) {
+        attempts['GET ct=$t'] = [t, 'GET', ''];
+      }
 
       final log = StringBuffer();
       log.writeln(path);
       dynamic good;
 
       for (final a in attempts.entries) {
-        final raw = await c.callAsyncJavaScript(functionBody: a.value);
+        final ct = a.value[0];
+        final method = a.value[1];
+        final payload = a.value[2];
+        final js = _fetchJs(path, method, method == 'GET' ? null : payload, ct);
+
+        final raw = await c.callAsyncJavaScript(functionBody: js);
         final value = raw?.value;
         if (value == null) {
           log.writeln('  ${a.key} -> no response');
@@ -129,10 +153,11 @@ class WebSession {
         }
         final status = env['status'];
         final text = '${env['body'] ?? ''}';
-        final short = text.length > 700 ? '${text.substring(0, 700)}...' : text;
+        final short = text.length > 500 ? '${text.substring(0, 500)}...' : text;
         log.writeln('  ${a.key} -> HTTP $status  $short');
 
         if (status == 200) {
+          goodClientType = ct;
           try {
             good = jsonDecode(text);
           } catch (_) {
@@ -140,6 +165,9 @@ class WebSession {
           }
           break;
         }
+        // A 404 means the path is wrong for this method - no point trying more
+        // client-type values with it.
+        if (status == 404 && method == 'GET') break;
       }
 
       lastDebug = log.toString();
@@ -154,14 +182,19 @@ class WebSession {
     });
   }
 
-  static String _fetchJs(String path, String method, String? body) {
+  static String _fetchJs(String path, String method, String? body, String clientType) {
     final url = jsonEncode(base + path);
     final m = jsonEncode(method);
+    final ct = jsonEncode(clientType);
     final bodyPart = body == null ? '' : ', body: ${jsonEncode(body)}';
     return "var res = await fetch($url, {"
         "method: $m,"
         "credentials: 'include',"
-        "headers: {'Content-Type': 'application/json', 'Accept': 'application/json, text/plain, */*'}"
+        "headers: {"
+        "'Content-Type': 'application/json',"
+        "'Accept': 'application/json, text/plain, */*',"
+        "'client-type': $ct"
+        "}"
         "$bodyPart"
         "});"
         "var text = await res.text();"
