@@ -30,8 +30,18 @@ class WebSession {
   static final _cookieMgr = CookieManager.instance();
   static final _lock = _Lock();
 
-  /// Transcript of the last operation — Settings → Diagnostics.
+  /// Rolling transcript of recent calls — Settings → Diagnostics.
   static String? lastDebug;
+
+  static final List<String> _history = [];
+
+  static void _record(String entry) {
+    _history.add(entry.trim());
+    while (_history.length > 6) {
+      _history.removeAt(0);
+    }
+    lastDebug = _history.join('\n\n');
+  }
 
   static HeadlessInAppWebView? _headless;
   static InAppWebViewController? _ctl;
@@ -98,6 +108,7 @@ class WebSession {
     List<Map<String, String>> cookies,
     String path, {
     Map<String, dynamic>? body,
+    Map<String, String> extraHeaders = const {},
     void Function(List<Map<String, String>>)? onCookies,
   }) {
     return _lock.run(() async {
@@ -136,7 +147,7 @@ class WebSession {
         final ct = a.value[0];
         final method = a.value[1];
         final payload = a.value[2];
-        final js = _fetchJs(path, method, method == 'GET' ? null : payload, ct);
+        final js = _fetchJs(path, method, method == 'GET' ? null : payload, ct, extraHeaders);
 
         final raw = await c.callAsyncJavaScript(functionBody: js);
         final value = raw?.value;
@@ -170,31 +181,38 @@ class WebSession {
         if (status == 404 && method == 'GET') break;
       }
 
-      lastDebug = log.toString();
+      _record(log.toString());
       onCookies?.call(await dumpCookies());
 
       if (good == null) {
         final t = log.toString();
-        if (t.contains('HTTP 401') || t.contains('HTTP 403')) throw SessionExpired();
+        // errorCode 1001 means a required header is missing, not a dead session.
+        final missingHeader = t.contains('1001') || t.contains('Identifier not present');
+        if (!missingHeader && (t.contains('HTTP 401') || t.contains('HTTP 403'))) {
+          throw SessionExpired();
+        }
         throw Exception('No usable response - see Settings, Session diagnostics');
       }
       return good;
     });
   }
 
-  static String _fetchJs(String path, String method, String? body, String clientType) {
+  static String _fetchJs(String path, String method, String? body, String clientType,
+      Map<String, String> extra) {
     final url = jsonEncode(base + path);
     final m = jsonEncode(method);
-    final ct = jsonEncode(clientType);
+    final headers = <String, String>{
+      'Content-Type': 'application/json',
+      'Accept': 'application/json, text/plain, */*',
+      'client-type': clientType,
+      ...extra,
+    };
+    final h = jsonEncode(headers);
     final bodyPart = body == null ? '' : ', body: ${jsonEncode(body)}';
     return "var res = await fetch($url, {"
         "method: $m,"
         "credentials: 'include',"
-        "headers: {"
-        "'Content-Type': 'application/json',"
-        "'Accept': 'application/json, text/plain, */*',"
-        "'client-type': $ct"
-        "}"
+        "headers: $h"
         "$bodyPart"
         "});"
         "var text = await res.text();"
@@ -254,7 +272,7 @@ class WebSession {
           await Future.delayed(const Duration(milliseconds: 1600));
           final cookies = await dumpCookies();
           log.writeln('landed on $url with ${cookies.length} cookie(s)');
-          lastDebug = log.toString();
+          _record(log.toString());
           if (cookies.isEmpty) throw Exception('Logged in but no cookies were set');
           return cookies;
         }
@@ -270,17 +288,17 @@ class WebSession {
         final st = '$state';
         if (st.contains('wrong')) {
           log.writeln('Meesho rejected the credentials');
-          lastDebug = log.toString();
+          _record(log.toString());
           throw Exception('Wrong email or password');
         }
         if (st.contains('challenge')) {
           log.writeln('captcha / SMS-OTP step - handing over to the visible sheet');
-          lastDebug = log.toString();
+          _record(log.toString());
           throw _NeedsUser();
         }
       }
       log.writeln('timed out on the login page');
-      lastDebug = log.toString();
+      _record(log.toString());
       throw _NeedsUser();
     } finally {
       await hw.dispose();
