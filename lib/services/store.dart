@@ -188,9 +188,10 @@ class AppStore extends ChangeNotifier {
     notifyListeners();
     try {
       // Plain HTTP gets a 403 from Meesho's edge, so the login runs in a real
-      // WebView and we keep the cookies it produces.
-      final cookies = await WebSession.login(email: a.email, password: a.password);
-      a.cookies = cookies;
+      // WebView. It also hands back the identifier from the panel URL.
+      final r = await WebSession.login(email: a.email, password: a.password);
+      a.cookies = r.cookies;
+      if (r.identifier.isNotEmpty) a.identifier = r.identifier;
       a.lastLogin = DateTime.now().millisecondsSinceEpoch;
       a.status = AccStatus.ok;
       return null;
@@ -207,23 +208,17 @@ class AppStore extends ChangeNotifier {
     try {
       if (a.cookies.isEmpty) throw SessionExpired();
 
-      // The OTP endpoint answers 403 / errorCode 1001 unless it gets the
-      // supplier's identifier, which comes from the registration-status call.
-      if (a.identifier.isEmpty || a.supplierId.isEmpty) {
-        await _fetchDetails(a);
+      // Meesho answers 403 / errorCode 1001 without the identifier. Accounts
+      // saved before we started capturing it get it recovered here.
+      if (a.identifier.isEmpty) {
+        a.identifier = await WebSession.discoverIdentifier(a.cookies);
+        if (a.identifier.isEmpty) throw SessionExpired();
       }
 
       final data = await WebSession.apiCall(
         a.cookies,
         '/api/fulfillment/returnRto/fetchDeliveryOTPs',
-        body: {
-          if (a.supplierId.isNotEmpty) 'supplier_id': int.tryParse(a.supplierId) ?? a.supplierId,
-          if (a.identifier.isNotEmpty) 'supplier_identifier': a.identifier,
-        },
-        extraHeaders: {
-          if (a.identifier.isNotEmpty) 'identifier': a.identifier,
-          if (a.identifier.isNotEmpty) 'supplier-identifier': a.identifier,
-        },
+        identifier: a.identifier,
         onCookies: (c) {
           if (c.isNotEmpty) a.cookies = c;
         },
@@ -236,6 +231,10 @@ class AppStore extends ChangeNotifier {
       if (a.otps.isEmpty) {
         MeeshoApi.lastRawResponse = WebSession.lastDebug;
         a.lastError = 'Logged in, but no OTPs in the response - see Settings, Session diagnostics';
+      }
+
+      if (a.supplierId.isEmpty || (a.autoName && a.name.contains('@'))) {
+        unawaited(_fetchDetails(a));
       }
     } on SessionExpired {
       if (allowRelogin) {
@@ -255,40 +254,13 @@ class AppStore extends ChangeNotifier {
     }
   }
 
-  /// Pulls the supplier identifier, id and store name. The identifier lives in
-  /// the registration-status response; getSupplierDetails fills in the rest.
+  /// Store name and supplier id — nice to have, never fatal.
   Future<void> _fetchDetails(Account a) async {
-    try {
-      final reg = await WebSession.apiCall(
-        a.cookies,
-        '/api/container/supplier/fetch-registration-status2',
-      );
-      final ident = MeeshoApi.digInto(reg, const [
-        'supplier_identifier', 'identifier', 'child_supplier_identifier', 'uuid',
-      ]);
-      if (ident != null && ident.isNotEmpty) a.identifier = ident;
-
-      final id = MeeshoApi.digInto(reg, const ['supplier_id', 'supplierId', 'id']);
-      if (id != null && id.isNotEmpty) a.supplierId = id;
-
-      final nm = MeeshoApi.digInto(reg, const [
-        'name', 'supplier_name', 'business_name', 'shop_name', 'display_name', 'store_name',
-      ]);
-      if (nm != null && nm.isNotEmpty && a.autoName) a.name = nm;
-      notifyListeners();
-    } catch (_) {
-      // fall through - the details call below may still work
-    }
-
-    if (a.supplierId.isNotEmpty && (!a.autoName || !a.name.contains('@'))) return;
-
     try {
       final d = await WebSession.apiCall(
         a.cookies,
         '/api/container/supplier/getSupplierDetails',
-        extraHeaders: {
-          if (a.identifier.isNotEmpty) 'identifier': a.identifier,
-        },
+        identifier: a.identifier,
       );
       final id = MeeshoApi.digInto(d, const ['supplier_id', 'supplierId', 'id']);
       final nm = MeeshoApi.digInto(d, const [
