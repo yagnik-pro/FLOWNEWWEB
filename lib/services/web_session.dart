@@ -304,21 +304,48 @@ class WebSession {
   }
 
   /// Reads the store name straight off the panel. The API route for this keeps
-  /// returning 403, but the page has the name in plain sight — in the sidebar
-  /// header and in the "Welcome back, X" greeting.
+  /// returning 403, but the page shows the name in the sidebar header and in
+  /// the "Welcome back, X" greeting.
+  ///
+  /// Everything is validated before it is handed back: the sidebar also holds
+  /// icons, ellipses and loading placeholders, and those used to slip through.
   static const _storeNameJs = "(function(){try{"
+      "function ok(s){"
+      "if(!s)return false;"
+      "s=s.trim();"
+      "if(s.length<2||s.length>60)return false;"
+      "var letters=s.replace(/[^A-Za-z\\u0900-\\u097F]/g,'');"
+      "if(letters.length<2)return false;"
+      "if(/^[.\\u2026\\s\\-_|]+$/.test(s))return false;"
+      "if(/^(loading|undefined|null|menu|notices|support)$/i.test(s))return false;"
+      "return true;}"
       "var t=document.body.innerText||'';"
       "var m=t.match(/Welcome back,\\s*([^\\n]{2,60})/i);"
-      "if(m&&m[1])return m[1].trim();"
-      "var side=document.querySelector('aside,nav,[class*=\"sidebar\" i],[class*=\"Sidebar\" i]');"
-      "if(side){var lines=(side.innerText||'').split('\\n').map(function(x){return x.trim();})"
-      ".filter(function(x){return x&&x.length>1&&x.length<60&&!/notice|support|home|order|return|pricing|claim|inventory|catalog|quality|payment|warehouse|service|menu/i.test(x);});"
-      "if(lines.length)return lines[0];}"
-      "for(var i=0;i<localStorage.length;i++){var k=localStorage.key(i);var v=localStorage.getItem(k)||'';"
-      "var n=v.match(/\"(?:supplier_name|business_name|shop_name|store_name)\"\\s*:\\s*\"([^\"]{2,60})\"/);"
-      "if(n)return n[1];}"
+      "if(m&&ok(m[1]))return m[1].trim();"
+      "var sels=['aside','nav','[class*=\"sidebar\" i]','[class*=\"Sidebar\" i]','header'];"
+      "for(var i=0;i<sels.length;i++){"
+      "var el=document.querySelector(sels[i]);"
+      "if(!el)continue;"
+      "var lines=(el.innerText||'').split('\\n');"
+      "for(var j=0;j<lines.length;j++){"
+      "var L=lines[j].trim();"
+      "if(/notice|support|^home$|^orders?$|^returns?$|pricing|claim|inventory|catalog|quality|payment|warehouse|service|menu|advertis|promotion|influencer|instant cash|pay later/i.test(L))continue;"
+      "if(ok(L))return L;}}"
+      "for(var k=0;k<localStorage.length;k++){"
+      "var key=localStorage.key(k);var v=localStorage.getItem(key)||'';"
+      "var n=v.match(/\"(?:supplier_name|business_name|shop_name|store_name|name)\"\\s*:\\s*\"([^\"]{2,60})\"/);"
+      "if(n&&ok(n[1]))return n[1];}"
       "return '';"
       "}catch(e){return '';}})();";
+
+  /// Same validation on the Dart side, so nothing odd reaches the UI.
+  static bool looksLikeStoreName(String s) {
+    final v = s.trim();
+    if (v.length < 2 || v.length > 60) return false;
+    if (v.toLowerCase() == 'null' || v.toLowerCase() == 'undefined') return false;
+    final letters = RegExp(r'[A-Za-z\u0900-\u097F]').allMatches(v).length;
+    return letters >= 2;
+  }
 
   // ======================================================= panel interception
   /// Injected before any page script runs. It wraps `fetch` and `XMLHttpRequest`
@@ -396,7 +423,7 @@ class WebSession {
           if (storeName.isEmpty) {
             final n = await c.evaluateJavascript(source: _storeNameJs);
             final v = '${n ?? ''}'.trim();
-            if (v.isNotEmpty && v != 'null') {
+            if (looksLikeStoreName(v)) {
               storeName = v;
               log.writeln('  store name from page: $storeName');
             }
