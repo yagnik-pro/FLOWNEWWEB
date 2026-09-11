@@ -207,17 +207,23 @@ class AppStore extends ChangeNotifier {
     try {
       if (a.cookies.isEmpty) throw SessionExpired();
 
-      // supplier id / store name first — the OTP endpoint wants the id.
-      if (a.supplierId.isEmpty || (a.autoName && a.name.contains('@'))) {
+      // The OTP endpoint answers 403 / errorCode 1001 unless it gets the
+      // supplier's identifier, which comes from the registration-status call.
+      if (a.identifier.isEmpty || a.supplierId.isEmpty) {
         await _fetchDetails(a);
       }
 
       final data = await WebSession.apiCall(
         a.cookies,
         '/api/fulfillment/returnRto/fetchDeliveryOTPs',
-        body: a.supplierId.isEmpty
-            ? const {}
-            : {'supplier_id': int.tryParse(a.supplierId) ?? a.supplierId},
+        body: {
+          if (a.supplierId.isNotEmpty) 'supplier_id': int.tryParse(a.supplierId) ?? a.supplierId,
+          if (a.identifier.isNotEmpty) 'supplier_identifier': a.identifier,
+        },
+        extraHeaders: {
+          if (a.identifier.isNotEmpty) 'identifier': a.identifier,
+          if (a.identifier.isNotEmpty) 'supplier-identifier': a.identifier,
+        },
         onCookies: (c) {
           if (c.isNotEmpty) a.cookies = c;
         },
@@ -229,7 +235,7 @@ class AppStore extends ChangeNotifier {
       a.lastError = null;
       if (a.otps.isEmpty) {
         MeeshoApi.lastRawResponse = WebSession.lastDebug;
-        a.lastError = 'Logged in, but no OTPs in the response — see Settings, Session diagnostics';
+        a.lastError = 'Logged in, but no OTPs in the response - see Settings, Session diagnostics';
       }
     } on SessionExpired {
       if (allowRelogin) {
@@ -241,7 +247,7 @@ class AppStore extends ChangeNotifier {
         a.status = AccStatus.needsLogin;
       } else {
         a.status = AccStatus.needsLogin;
-        a.lastError = 'Session expired — tap relogin';
+        a.lastError = 'Session expired - tap relogin';
       }
     } catch (e) {
       a.status = AccStatus.error;
@@ -249,9 +255,41 @@ class AppStore extends ChangeNotifier {
     }
   }
 
+  /// Pulls the supplier identifier, id and store name. The identifier lives in
+  /// the registration-status response; getSupplierDetails fills in the rest.
   Future<void> _fetchDetails(Account a) async {
     try {
-      final d = await WebSession.apiCall(a.cookies, '/api/container/supplier/getSupplierDetails');
+      final reg = await WebSession.apiCall(
+        a.cookies,
+        '/api/container/supplier/fetch-registration-status2',
+      );
+      final ident = MeeshoApi.digInto(reg, const [
+        'supplier_identifier', 'identifier', 'child_supplier_identifier', 'uuid',
+      ]);
+      if (ident != null && ident.isNotEmpty) a.identifier = ident;
+
+      final id = MeeshoApi.digInto(reg, const ['supplier_id', 'supplierId', 'id']);
+      if (id != null && id.isNotEmpty) a.supplierId = id;
+
+      final nm = MeeshoApi.digInto(reg, const [
+        'name', 'supplier_name', 'business_name', 'shop_name', 'display_name', 'store_name',
+      ]);
+      if (nm != null && nm.isNotEmpty && a.autoName) a.name = nm;
+      notifyListeners();
+    } catch (_) {
+      // fall through - the details call below may still work
+    }
+
+    if (a.supplierId.isNotEmpty && (!a.autoName || !a.name.contains('@'))) return;
+
+    try {
+      final d = await WebSession.apiCall(
+        a.cookies,
+        '/api/container/supplier/getSupplierDetails',
+        extraHeaders: {
+          if (a.identifier.isNotEmpty) 'identifier': a.identifier,
+        },
+      );
       final id = MeeshoApi.digInto(d, const ['supplier_id', 'supplierId', 'id']);
       final nm = MeeshoApi.digInto(d, const [
         'name', 'supplier_name', 'business_name', 'shop_name', 'display_name', 'store_name',
@@ -259,9 +297,7 @@ class AppStore extends ChangeNotifier {
       if (id != null && id.isNotEmpty) a.supplierId = id;
       if (nm != null && nm.isNotEmpty && a.autoName) a.name = nm;
       notifyListeners();
-    } catch (_) {
-      // not fatal — the OTP call may still work without the id
-    }
+    } catch (_) {}
   }
 
   void _notifyNew(Map<String, Set<String>> before) {
