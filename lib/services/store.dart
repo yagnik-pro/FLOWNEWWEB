@@ -215,14 +215,31 @@ class AppStore extends ChangeNotifier {
         if (a.identifier.isEmpty) throw SessionExpired();
       }
 
-      final data = await WebSession.apiCall(
-        a.cookies,
-        '/api/fulfillment/returnRto/fetchDeliveryOTPs',
-        identifier: a.identifier,
-        onCookies: (c) {
-          if (c.isNotEmpty) a.cookies = c;
-        },
-      );
+      // Let the panel build the request itself and just read what it got back.
+      // Hand-made calls to this endpoint return 500 — the payload it wants is
+      // not something worth guessing at.
+      dynamic data;
+      try {
+        data = await WebSession.fetchOtpsViaPanel(
+          a.cookies,
+          a.identifier,
+          onCookies: (c) {
+            if (c.isNotEmpty) a.cookies = c;
+          },
+        );
+      } on SessionExpired {
+        rethrow;
+      } catch (_) {
+        // Fallback: direct API call, in case the page layout changed.
+        data = await WebSession.apiCall(
+          a.cookies,
+          '/api/fulfillment/returnRto/fetchDeliveryOTPs',
+          identifier: a.identifier,
+          onCookies: (c) {
+            if (c.isNotEmpty) a.cookies = c;
+          },
+        );
+      }
 
       a.otps = MeeshoApi.parseOtps(data);
       a.fetchedAt = DateTime.now().millisecondsSinceEpoch;
