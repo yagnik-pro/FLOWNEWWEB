@@ -6,33 +6,51 @@ import 'package:flutter_inappwebview/flutter_inappwebview.dart';
 
 import '../theme.dart';
 
-/// Meesho's edge returns 403 to plain HTTP clients — even for the login page.
-/// A WebView is a real browser, so it is never blocked. Everything therefore
-/// runs through one:
+/// What a successful login yields: the session cookies plus the supplier
+/// identifier, which Meesho puts straight into the panel URL
+/// (`/panel/v3/new/growth/<identifier>/home`).
+class LoginResult {
+  final List<Map<String, String>> cookies;
+  final String identifier;
+  const LoginResult({required this.cookies, required this.identifier});
+}
+
+class SessionExpired implements Exception {
+  @override
+  String toString() => 'Session expired';
+}
+
+/// Raised when Meesho needs a human (captcha / SMS-OTP).
+class _NeedsUser implements Exception {}
+
+/// Meesho's edge returns 403 to plain HTTP clients — even for the login page —
+/// so everything runs through a real WebView.
 ///
-///   * [login]   — opens the panel login page in a sheet, fills the form, and
-///                 hands back that account's cookies once the redirect happens.
-///                 If Meesho asks for a captcha or SMS-OTP the sheet is already
-///                 on screen, so the person just finishes it.
-///   * [apiCall] — runs `fetch()` inside a hidden WebView. The request carries
-///                 the real cookies and browser fingerprint, so the WAF leaves
-///                 it alone. A fetch is just an XHR — well under a second.
+///   * [login]   — loads the panel login page in a hidden WebView, fills the
+///                 form, and hands back the cookies plus the identifier once
+///                 Meesho redirects. Only if a captcha / SMS-OTP step appears
+///                 does a visible sheet open for the person to finish it.
+///   * [apiCall] — runs `fetch()` inside a hidden WebView, so the request
+///                 carries the real cookies and fingerprint. A fetch is just an
+///                 XHR, so it returns in well under a second.
 ///
 /// Android's WebView cookie store is global, so accounts are processed one at a
-/// time: clear cookies → inject this account's → do the work → save them back.
+/// time: clear cookies → install this account's → do the work → save them back.
 class WebSession {
   static const base = 'https://supplier.meesho.com';
   static const loginUrl = '$base/panel/v3/new/root/login';
 
-  /// Set on the MaterialApp so the login sheet can be shown from anywhere.
+  /// Set on the MaterialApp so the login sheet can open from anywhere.
   static final navigatorKey = GlobalKey<NavigatorState>();
 
   static final _cookieMgr = CookieManager.instance();
   static final _lock = _Lock();
 
-  /// Rolling transcript of recent calls — Settings → Diagnostics.
-  static String? lastDebug;
+  static const ua = 'Mozilla/5.0 (Linux; Android 14; SM-S918B) AppleWebKit/537.36 '
+      '(KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36';
 
+  /// Rolling transcript of recent calls — Settings → Session diagnostics.
+  static String? lastDebug;
   static final List<String> _history = [];
 
   static void _record(String entry) {
@@ -46,7 +64,7 @@ class WebSession {
   static HeadlessInAppWebView? _headless;
   static InAppWebViewController? _ctl;
 
-  // ----------------------------------------------------------------- cookies
+  // ================================================================= cookies
   static Future<List<Map<String, String>>> dumpCookies() async {
     final list = await _cookieMgr.getCookies(url: WebUri(base));
     return list.map((c) => {'name': c.name, 'value': '${c.value}'}).toList();
@@ -69,7 +87,40 @@ class WebSession {
     }
   }
 
-  // ------------------------------------------------------- headless instance
+  // ================================================================ identity
+  /// The panel identifies a seller by the short code in its own URLs, e.g.
+  /// `/panel/v3/new/growth/wb41m/home` → `wb41m`. Every XHR the panel makes
+  /// sends it as the `identifier` header; without it the API answers
+  /// `403 {"errorCode":1001,"message":"Identifier not present or invalid"}`.
+  static String identifierFromUrl(String url) {
+    final m = RegExp(r'/panel/v3/new/(?!root\b)[^/]+/([A-Za-z0-9]{3,16})(?:/|$)')
+        .firstMatch(url);
+    return m == null ? '' : m.group(1)!;
+  }
+
+  /// Loads the panel with [cookies] installed and reads the identifier out of
+  /// whatever URL Meesho lands on. Used for accounts saved before we started
+  /// capturing it at login.
+  static Future<String> discoverIdentifier(List<Map<String, String>> cookies) {
+    return _lock.run(() async {
+      await _installCookies(cookies);
+      final c = await _ensureHeadless();
+      await c.loadUrl(urlRequest: URLRequest(url: WebUri('$base/panel/v3/new/root/home')));
+      for (var i = 0; i < 12; i++) {
+        await Future.delayed(const Duration(milliseconds: 800));
+        final url = (await c.getUrl())?.toString() ?? '';
+        final ident = identifierFromUrl(url);
+        if (ident.isNotEmpty) {
+          _record('identifier discovered from $url -> $ident');
+          return ident;
+        }
+      }
+      _record('could not discover an identifier from the panel URL');
+      return '';
+    });
+  }
+
+  // ======================================================= headless instance
   static Future<InAppWebViewController> _ensureHeadless() async {
     if (_ctl != null) return _ctl!;
     final ready = Completer<InAppWebViewController>();
@@ -78,8 +129,7 @@ class WebSession {
       initialSettings: InAppWebViewSettings(
         javaScriptEnabled: true,
         thirdPartyCookiesEnabled: true,
-        userAgent: 'Mozilla/5.0 (Linux; Android 14; SM-S918B) AppleWebKit/537.36 '
-            '(KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36',
+        userAgent: ua,
       ),
       onWebViewCreated: (c) => _ctl = c,
       onLoadStop: (c, url) {
@@ -93,22 +143,21 @@ class WebSession {
     );
   }
 
-  /// Header values Meesho's API accepts for `client-type`. The panel sends one
-  /// of these on every XHR — without it the API answers
+  // ================================================================ API call
+  /// Values Meesho accepts for `client-type`. Anything else gets
   /// `400 {"message":"Bad Request. Invalid client type."}`.
   static const _clientTypes = ['web', 'supplier-web', 'supplier', 'android'];
 
-  /// Remembered once we learn which value this account's API accepts.
+  /// Remembered once we learn which value works, so later calls are one shot.
   static String? goodClientType;
 
-  /// Calls a Meesho API path from inside the hidden WebView, with [cookies]
-  /// installed for the duration. Tries the request shapes Meesho is known to
-  /// accept and returns the first decoded JSON body that comes back 200.
+  /// Calls a Meesho API path from inside the hidden WebView with [cookies]
+  /// installed, and returns the first decoded body that comes back 200.
   static Future<dynamic> apiCall(
     List<Map<String, String>> cookies,
     String path, {
     Map<String, dynamic>? body,
-    Map<String, String> extraHeaders = const {},
+    String identifier = '',
     void Function(List<Map<String, String>>)? onCookies,
   }) {
     return _lock.run(() async {
@@ -122,63 +171,54 @@ class WebSession {
         await Future.delayed(const Duration(milliseconds: 1800));
       }
 
-      // Put the value that already worked first so later calls are single-shot.
       final types = <String>[
         if (goodClientType != null) goodClientType!,
         ..._clientTypes.where((t) => t != goodClientType),
       ];
 
-      final attempts = <String, List<String>>{};
-      for (final t in types) {
-        if (body != null) {
-          attempts['POST body ct=$t'] = [t, 'POST', jsonEncode(body)];
-        }
-        attempts['POST empty ct=$t'] = [t, 'POST', '{}'];
-      }
-      for (final t in types) {
-        attempts['GET ct=$t'] = [t, 'GET', ''];
-      }
-
+      final shownId = identifier.isEmpty ? '(none)' : identifier;
       final log = StringBuffer();
-      log.writeln(path);
+      log.writeln('$path  identifier=$shownId');
       dynamic good;
 
-      for (final a in attempts.entries) {
-        final ct = a.value[0];
-        final method = a.value[1];
-        final payload = a.value[2];
-        final js = _fetchJs(path, method, method == 'GET' ? null : payload, ct, extraHeaders);
-
-        final raw = await c.callAsyncJavaScript(functionBody: js);
-        final value = raw?.value;
-        if (value == null) {
-          log.writeln('  ${a.key} -> no response');
-          continue;
-        }
-        Map<String, dynamic> env;
-        try {
-          env = jsonDecode('$value') as Map<String, dynamic>;
-        } catch (_) {
-          log.writeln('  ${a.key} -> unreadable: $value');
-          continue;
-        }
-        final status = env['status'];
-        final text = '${env['body'] ?? ''}';
-        final short = text.length > 500 ? '${text.substring(0, 500)}...' : text;
-        log.writeln('  ${a.key} -> HTTP $status  $short');
-
-        if (status == 200) {
-          goodClientType = ct;
-          try {
-            good = jsonDecode(text);
-          } catch (_) {
-            good = text;
+      outer:
+      for (final ct in types) {
+        final payloads = <String, String>{
+          if (body != null) 'body': jsonEncode(body),
+          'empty': '{}',
+        };
+        for (final pl in payloads.entries) {
+          final js = _fetchJs(path, pl.value, ct, identifier);
+          final raw = await c.callAsyncJavaScript(functionBody: js);
+          final value = raw?.value;
+          if (value == null) {
+            log.writeln('  POST ${pl.key} ct=$ct -> no response');
+            continue;
           }
-          break;
+          Map<String, dynamic> env;
+          try {
+            env = jsonDecode('$value') as Map<String, dynamic>;
+          } catch (_) {
+            log.writeln('  POST ${pl.key} ct=$ct -> unreadable: $value');
+            continue;
+          }
+          final status = env['status'];
+          final text = '${env['body'] ?? ''}';
+          final short = text.length > 500 ? '${text.substring(0, 500)}...' : text;
+          log.writeln('  POST ${pl.key} ct=$ct -> HTTP $status  $short');
+
+          if (status == 200) {
+            goodClientType = ct;
+            try {
+              good = jsonDecode(text);
+            } catch (_) {
+              good = text;
+            }
+            break outer;
+          }
+          // "Invalid client type" means this value is simply wrong — move on.
+          if (status == 400 && text.contains('client type')) continue outer;
         }
-        // A 404 means the path is wrong for this method - no point trying more
-        // client-type values with it.
-        if (status == 404 && method == 'GET') break;
       }
 
       _record(log.toString());
@@ -197,34 +237,29 @@ class WebSession {
     });
   }
 
-  static String _fetchJs(String path, String method, String? body, String clientType,
-      Map<String, String> extra) {
+  static String _fetchJs(String path, String body, String clientType, String identifier) {
     final url = jsonEncode(base + path);
-    final m = jsonEncode(method);
     final headers = <String, String>{
       'Content-Type': 'application/json',
       'Accept': 'application/json, text/plain, */*',
       'client-type': clientType,
-      ...extra,
+      if (identifier.isNotEmpty) 'identifier': identifier,
     };
     final h = jsonEncode(headers);
-    final bodyPart = body == null ? '' : ', body: ${jsonEncode(body)}';
+    final b = jsonEncode(body);
     return "var res = await fetch($url, {"
-        "method: $m,"
+        "method: 'POST',"
         "credentials: 'include',"
-        "headers: $h"
-        "$bodyPart"
+        "headers: $h,"
+        "body: $b"
         "});"
         "var text = await res.text();"
         "return JSON.stringify({ status: res.status, body: text });";
   }
 
-  // ------------------------------------------------------------------- login
-  /// Logs in and returns that account's cookies.
-  ///
-  /// Runs hidden first. Only if Meesho throws up a captcha / SMS-OTP step does
-  /// the visible sheet open, so the person can finish it.
-  static Future<List<Map<String, String>>> login({
+  // =================================================================== login
+  /// Logs in and returns the account's cookies plus its identifier.
+  static Future<LoginResult> login({
     required String email,
     required String password,
   }) async {
@@ -236,7 +271,7 @@ class WebSession {
   }
 
   /// Silent login in a throwaway headless WebView.
-  static Future<List<Map<String, String>>> _headlessLogin(String email, String password) async {
+  static Future<LoginResult> _headlessLogin(String email, String password) async {
     await _cookieMgr.deleteAllCookies();
     final log = StringBuffer();
     log.writeln('hidden login for $email');
@@ -248,7 +283,7 @@ class WebSession {
       initialSettings: InAppWebViewSettings(
         javaScriptEnabled: true,
         thirdPartyCookiesEnabled: true,
-        userAgent: _ua,
+        userAgent: ua,
       ),
       onWebViewCreated: (c) => ctl = c,
       onLoadStop: (c, url) {
@@ -268,13 +303,14 @@ class WebSession {
         if (c == null) continue;
 
         final url = (await c.getUrl())?.toString() ?? '';
-        if (url.isNotEmpty && !_isLoginUrl(url)) {
+        if (url.isNotEmpty && !isLoginUrl(url)) {
           await Future.delayed(const Duration(milliseconds: 1600));
           final cookies = await dumpCookies();
-          log.writeln('landed on $url with ${cookies.length} cookie(s)');
+          final ident = identifierFromUrl(url);
+          log.writeln('landed on $url with ${cookies.length} cookie(s), identifier=$ident');
           _record(log.toString());
           if (cookies.isEmpty) throw Exception('Logged in but no cookies were set');
-          return cookies;
+          return LoginResult(cookies: cookies, identifier: ident);
         }
 
         if (!filled) {
@@ -305,12 +341,12 @@ class WebSession {
     }
   }
 
-  /// Visible fallback — used only when Meesho asks for something a human must do.
-  static Future<List<Map<String, String>>> _sheetLogin(String email, String password) {
+  /// Visible fallback — only when Meesho asks for something a human must do.
+  static Future<LoginResult> _sheetLogin(String email, String password) {
     return _lock.run(() async {
       final ctx = navigatorKey.currentContext;
       if (ctx == null) throw Exception('App is not ready yet');
-      final cookies = await showModalBottomSheet<List<Map<String, String>>>(
+      final result = await showModalBottomSheet<LoginResult>(
         context: ctx,
         isScrollControlled: true,
         isDismissible: false,
@@ -321,20 +357,17 @@ class WebSession {
         ),
         builder: (_) => _LoginSheet(email: email, password: password),
       );
-      if (cookies == null || cookies.isEmpty) {
+      if (result == null || result.cookies.isEmpty) {
         throw Exception('Login did not complete - see Settings, Session diagnostics');
       }
-      return cookies;
+      return result;
     });
   }
 
-  static bool _isLoginUrl(String url) =>
+  static bool isLoginUrl(String url) =>
       url.contains('/login') ||
       url.contains('/signin') ||
       RegExp(r'/root/?$').hasMatch(url);
-
-  static const _ua = 'Mozilla/5.0 (Linux; Android 14; SM-S918B) AppleWebKit/537.36 '
-      '(KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36';
 
   /// JS that fills the Meesho login form and presses the button.
   static String fillScript(String email, String password) {
@@ -363,15 +396,7 @@ class WebSession {
       "return 'waiting';})();";
 }
 
-/// Raised when Meesho needs a human (captcha / SMS-OTP).
-class _NeedsUser implements Exception {}
-
-class SessionExpired implements Exception {
-  @override
-  String toString() => 'Session expired';
-}
-
-// =========================================================== the login sheet
+// ============================================================== login sheet
 class _LoginSheet extends StatefulWidget {
   final String email, password;
   const _LoginSheet({required this.email, required this.password});
@@ -384,7 +409,6 @@ class _LoginSheetState extends State<_LoginSheet> {
   InAppWebViewController? _c;
   Timer? _poll;
   bool _filled = false;
-  bool _needsUser = false;
   int _elapsed = 0;
   String _status = 'Meesho needs a quick check — please finish it below';
   final _log = StringBuffer();
@@ -398,60 +422,53 @@ class _LoginSheetState extends State<_LoginSheet> {
   void _startPolling() {
     _poll?.cancel();
     _poll = Timer.periodic(const Duration(milliseconds: 1200), (t) async {
-      if (!mounted) { t.cancel(); return; }
+      if (!mounted) {
+        t.cancel();
+        return;
+      }
       _elapsed += 1200;
       final c = _c;
       if (c == null) return;
 
-      if (_elapsed > 120000) {
+      if (_elapsed > 180000) {
         t.cancel();
-        _finish(null, 'Timed out');
+        _finish(null, 'timed out');
         return;
       }
 
       final url = (await c.getUrl())?.toString() ?? '';
-      if (url.isNotEmpty && !_isLogin(url)) {
+      if (url.isNotEmpty && !WebSession.isLoginUrl(url)) {
         t.cancel();
         setState(() => _status = 'Logged in — saving session…');
         await Future.delayed(const Duration(milliseconds: 1600));
         final cookies = await WebSession.dumpCookies();
-        _log.writeln('landed on $url with ${cookies.length} cookie(s)');
-        _finish(cookies, 'done');
+        final ident = WebSession.identifierFromUrl(url);
+        _log.writeln('landed on $url with ${cookies.length} cookie(s), identifier=$ident');
+        _finish(LoginResult(cookies: cookies, identifier: ident), 'done');
         return;
       }
 
       if (!_filled) {
-        final r = await c.evaluateJavascript(source: WebSession.fillScript(widget.email, widget.password));
-        _log.writeln('fill → $r');
-        if ('$r'.contains('submitted')) {
-          _filled = true;
-          if (mounted) setState(() => _status = 'Signing in…');
-        }
+        final r = await c.evaluateJavascript(
+            source: WebSession.fillScript(widget.email, widget.password));
+        _log.writeln('fill -> $r');
+        if ('$r'.contains('submitted')) _filled = true;
         return;
       }
 
       final state = await c.evaluateJavascript(source: WebSession.stateScript);
-      final s = '$state';
-      if (s.contains('wrong')) {
+      if ('$state'.contains('wrong')) {
         t.cancel();
         _log.writeln('Meesho rejected the credentials');
-        _finish(null, 'Wrong email or password');
-      } else if (s.contains('challenge') && !_needsUser) {
-        setState(() {
-          _needsUser = true;
-          _status = 'Meesho needs a quick check — please finish it below';
-        });
+        _finish(null, 'wrong email or password');
       }
     });
   }
 
-  void _finish(List<Map<String, String>>? cookies, String note) {
+  void _finish(LoginResult? result, String note) {
     WebSession.lastDebug = '${_log.toString()}\n$note';
-    if (mounted) Navigator.of(context).pop(cookies);
+    if (mounted) Navigator.of(context).pop(result);
   }
-
-  bool _isLogin(String url) =>
-      url.contains('/login') || url.contains('/signin') || RegExp(r'/root/?$').hasMatch(url);
 
   @override
   Widget build(BuildContext context) {
@@ -490,25 +507,21 @@ class _LoginSheetState extends State<_LoginSheet> {
           ),
           const SizedBox(height: 8),
           Expanded(
-            child: ClipRRect(
-              child: InAppWebView(
-                initialUrlRequest: URLRequest(url: WebUri(WebSession.loginUrl)),
-                initialSettings: InAppWebViewSettings(
-                  javaScriptEnabled: true,
-                  thirdPartyCookiesEnabled: true,
-                  userAgent:
-                      'Mozilla/5.0 (Linux; Android 14; SM-S918B) AppleWebKit/537.36 '
-                      '(KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36',
-                ),
-                onWebViewCreated: (c) => _c = c,
-                onLoadStop: (c, url) {
-                  _log.writeln('loaded $url');
-                  if (_poll == null) _startPolling();
-                },
-                onReceivedError: (c, req, err) {
-                  _log.writeln('load error: ${err.description}');
-                },
+            child: InAppWebView(
+              initialUrlRequest: URLRequest(url: WebUri(WebSession.loginUrl)),
+              initialSettings: InAppWebViewSettings(
+                javaScriptEnabled: true,
+                thirdPartyCookiesEnabled: true,
+                userAgent: WebSession.ua,
               ),
+              onWebViewCreated: (c) => _c = c,
+              onLoadStop: (c, url) {
+                _log.writeln('loaded $url');
+                if (_poll == null) _startPolling();
+              },
+              onReceivedError: (c, req, err) {
+                _log.writeln('load error: ${err.description}');
+              },
             ),
           ),
         ],
