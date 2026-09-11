@@ -9,6 +9,7 @@ class Account {
   String name;          // shown in lists
   bool autoName;        // name came from Meesho, overwrite on refresh
   String supplierId;
+  String identifier;
   String token;
   List<Map<String, String>> cookies;
 
@@ -27,6 +28,7 @@ class Account {
     String? name,
     this.autoName = true,
     this.supplierId = '',
+    this.identifier = '',
     this.token = '',
     List<Map<String, String>>? cookies,
     this.status = AccStatus.idle,
@@ -48,6 +50,7 @@ class Account {
         'name': name,
         'autoName': autoName,
         'supplierId': supplierId,
+        'identifier': identifier,
         'token': token,
         'cookies': cookies,
         'lastLogin': lastLogin,
@@ -63,6 +66,7 @@ class Account {
         name: j['name'],
         autoName: j['autoName'] ?? true,
         supplierId: j['supplierId'] ?? '',
+        identifier: j['identifier'] ?? '',
         token: j['token'] ?? '',
         cookies: ((j['cookies'] ?? []) as List)
             .map((c) => Map<String, String>.from(c as Map))
