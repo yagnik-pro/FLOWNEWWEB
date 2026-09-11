@@ -216,17 +216,20 @@ class AppStore extends ChangeNotifier {
       }
 
       // Let the panel build the request itself and just read what it got back.
-      // Hand-made calls to this endpoint return 500 — the payload it wants is
-      // not something worth guessing at.
+      // Hand-made calls to this endpoint return 500 - the payload it wants is
+      // not something worth guessing at. The same pass also picks up the store
+      // name straight off the page.
       dynamic data;
       try {
-        data = await WebSession.fetchOtpsViaPanel(
+        final r = await WebSession.fetchOtpsViaPanel(
           a.cookies,
           a.identifier,
           onCookies: (c) {
             if (c.isNotEmpty) a.cookies = c;
           },
         );
+        data = r.otpData;
+        if (r.storeName.isNotEmpty && a.autoName) a.name = r.storeName;
       } on SessionExpired {
         rethrow;
       } catch (_) {
@@ -250,7 +253,7 @@ class AppStore extends ChangeNotifier {
         a.lastError = 'Logged in, but no OTPs in the response - see Settings, Session diagnostics';
       }
 
-      if (a.supplierId.isEmpty || (a.autoName && a.name.contains('@'))) {
+      if (a.autoName && a.name.contains('@')) {
         unawaited(_fetchDetails(a));
       }
     } on SessionExpired {
