@@ -192,7 +192,9 @@ class WebSession {
           final raw = await c.callAsyncJavaScript(functionBody: js);
           final value = raw?.value;
           if (value == null) {
-            log.writeln('  POST ${pl.key} ct=$ct -> no response');
+            final err = raw?.error;
+            final extra = err == null ? '' : ' (bridge error: $err)';
+            log.writeln('  POST ${pl.key} ct=$ct -> no value from JS$extra');
             continue;
           }
           Map<String, dynamic> env;
@@ -204,11 +206,16 @@ class WebSession {
           }
           final status = env['status'];
           final text = '${env['body'] ?? ''}';
+          final len = env['len'] ?? text.length;
           final short = text.length > 500 ? '${text.substring(0, 500)}...' : text;
-          log.writeln('  POST ${pl.key} ct=$ct -> HTTP $status  $short');
+          log.writeln('  POST ${pl.key} ct=$ct -> HTTP $status  [$len bytes]  $short');
+
+          final rejectedType = status == 400 && text.contains('client type');
+          // Anything other than "Invalid client type" means the server accepted
+          // this value, so stop cycling through the rest on later calls.
+          if (!rejectedType && status != -1) goodClientType = ct;
 
           if (status == 200) {
-            goodClientType = ct;
             try {
               good = jsonDecode(text);
             } catch (_) {
@@ -216,8 +223,7 @@ class WebSession {
             }
             break outer;
           }
-          // "Invalid client type" means this value is simply wrong — move on.
-          if (status == 400 && text.contains('client type')) continue outer;
+          if (rejectedType) continue outer;
         }
       }
 
@@ -247,14 +253,23 @@ class WebSession {
     };
     final h = jsonEncode(headers);
     final b = jsonEncode(body);
-    return "var res = await fetch($url, {"
+    // Wrapped in try/catch: a rejected fetch used to come back as a bare null,
+    // which told us nothing. Long bodies are trimmed so the JS bridge can
+    // always marshal the result back.
+    return "try {"
+        "var res = await fetch($url, {"
         "method: 'POST',"
         "credentials: 'include',"
         "headers: $h,"
         "body: $b"
         "});"
         "var text = await res.text();"
-        "return JSON.stringify({ status: res.status, body: text });";
+        "var full = text.length;"
+        "if (text.length > 120000) { text = text.slice(0, 120000); }"
+        "return JSON.stringify({ status: res.status, len: full, body: text });"
+        "} catch (e) {"
+        "return JSON.stringify({ status: -1, len: 0, body: 'JS error: ' + (e && e.message ? e.message : String(e)) });"
+        "}";
   }
 
   // =================================================================== login
