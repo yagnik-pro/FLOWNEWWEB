@@ -116,8 +116,16 @@ class AppStore extends ChangeNotifier {
   }
 
   Future<void> renameAccount(Account a, String name) async {
-    a.name = name.trim();
-    a.autoName = name.trim().isEmpty;
+    final v = name.trim();
+    if (v.isEmpty) {
+      // Cleared on purpose - fall back to the email prefix and let the next
+      // refresh pick the real name up off the panel again.
+      a.autoName = true;
+      a.name = a.email.split('@').first;
+    } else {
+      a.autoName = false;
+      a.name = v;
+    }
     await _save();
     notifyListeners();
   }
@@ -207,6 +215,11 @@ class AppStore extends ChangeNotifier {
     notifyListeners();
     try {
       if (a.cookies.isEmpty) throw SessionExpired();
+
+      // Older builds could save junk like "..." as the store name.
+      if (a.autoName && !WebSession.looksLikeStoreName(a.name)) {
+        a.name = a.email.split('@').first;
+      }
 
       // Meesho answers 403 / errorCode 1001 without the identifier. Accounts
       // saved before we started capturing it get it recovered here.
