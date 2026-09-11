@@ -30,7 +30,11 @@ jobs:
           test -d lib || { echo "!! lib/ MISSING - upload it to the repo"; exit 1; }
 
       - name: Create Android project shell
-        run: flutter create --platforms=android --org com.otpflow --project-name otpflow .
+        run: |
+          flutter create --platforms=android --org com.otpflow --project-name otpflow .
+          # flutter create drops in a sample test that references a class this app
+          # doesn't have (MyApp). It isn't ours and it breaks analysis — remove it.
+          rm -rf test
 
       - name: Restore custom AndroidManifest
         run: |
