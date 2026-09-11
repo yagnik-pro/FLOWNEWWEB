@@ -16,6 +16,13 @@ class LoginResult {
   const LoginResult({required this.cookies, required this.identifier});
 }
 
+/// What one pass over the panel's Returns page yields.
+class PanelResult {
+  final dynamic otpData;
+  final String storeName;
+  const PanelResult({required this.otpData, required this.storeName});
+}
+
 class SessionExpired implements Exception {
   @override
   String toString() => 'Session expired';
@@ -296,6 +303,23 @@ class WebSession {
     return false;
   }
 
+  /// Reads the store name straight off the panel. The API route for this keeps
+  /// returning 403, but the page has the name in plain sight — in the sidebar
+  /// header and in the "Welcome back, X" greeting.
+  static const _storeNameJs = "(function(){try{"
+      "var t=document.body.innerText||'';"
+      "var m=t.match(/Welcome back,\\s*([^\\n]{2,60})/i);"
+      "if(m&&m[1])return m[1].trim();"
+      "var side=document.querySelector('aside,nav,[class*=\"sidebar\" i],[class*=\"Sidebar\" i]');"
+      "if(side){var lines=(side.innerText||'').split('\\n').map(function(x){return x.trim();})"
+      ".filter(function(x){return x&&x.length>1&&x.length<60&&!/notice|support|home|order|return|pricing|claim|inventory|catalog|quality|payment|warehouse|service|menu/i.test(x);});"
+      "if(lines.length)return lines[0];}"
+      "for(var i=0;i<localStorage.length;i++){var k=localStorage.key(i);var v=localStorage.getItem(k)||'';"
+      "var n=v.match(/\"(?:supplier_name|business_name|shop_name|store_name)\"\\s*:\\s*\"([^\"]{2,60})\"/);"
+      "if(n)return n[1];}"
+      "return '';"
+      "}catch(e){return '';}})();";
+
   // ======================================================= panel interception
   /// Injected before any page script runs. It wraps `fetch` and `XMLHttpRequest`
   /// so every returns-related call the panel makes — request body and response —
@@ -325,7 +349,7 @@ class WebSession {
 
   /// Opens the panel's own Returns page and returns whatever its OTP call
   /// received. No payload guessing — the panel builds the request itself.
-  static Future<dynamic> fetchOtpsViaPanel(
+  static Future<PanelResult> fetchOtpsViaPanel(
     List<Map<String, String>> cookies,
     String identifier, {
     void Function(List<Map<String, String>>)? onCookies,
@@ -355,6 +379,7 @@ class WebSession {
       try {
         await hw.run();
         dynamic captured;
+        var storeName = '';
 
         for (var i = 0; i < 25; i++) {
           await Future.delayed(const Duration(milliseconds: 800));
@@ -366,6 +391,15 @@ class WebSession {
             log.writeln('bounced to the login page - session is dead');
             _record(log.toString());
             throw SessionExpired();
+          }
+
+          if (storeName.isEmpty) {
+            final n = await c.evaluateJavascript(source: _storeNameJs);
+            final v = '${n ?? ''}'.trim();
+            if (v.isNotEmpty && v != 'null') {
+              storeName = v;
+              log.writeln('  store name from page: $storeName');
+            }
           }
 
           final raw = await c.evaluateJavascript(
@@ -430,7 +464,7 @@ class WebSession {
         if (captured == null) {
           throw Exception('Panel did not return OTP data - see Settings, Session diagnostics');
         }
-        return captured;
+        return PanelResult(otpData: captured, storeName: storeName);
       } finally {
         await hw.dispose();
       }
