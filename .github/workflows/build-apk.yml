@@ -135,11 +135,17 @@ jobs:
         if: failure()
         run: |
           flutter build apk --release 2>&1 | tee err.txt || true
-          grep -iE "^(e:|error:|FAILURE|Execution failed|Caused by|\\* What went wrong)" err.txt | head -20 | while IFS= read -r line; do
+          echo "===== surfacing errors as annotations ====="
+          # Dart compile errors look like  lib/foo.dart:12:5: Error: <message>
+          grep -nE "\\.dart:[0-9]+:[0-9]+: (Error|Warning):" err.txt | head -25 | while IFS= read -r line; do
             echo "::error::$line"
           done
-          echo "===== last 120 lines ====="
-          tail -n 120 err.txt || true
+          # Gradle / toolchain failures
+          grep -nE "^(e:|error:|FAILURE:|Execution failed|Caused by:|\\* What went wrong)" err.txt | head -15 | while IFS= read -r line; do
+            echo "::error::$line"
+          done
+          echo "===== last 150 lines of the build log ====="
+          tail -n 150 err.txt || true
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
