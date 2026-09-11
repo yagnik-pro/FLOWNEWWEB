@@ -14,7 +14,7 @@ import '../theme.dart';
 ///                 hands back that account's cookies once the redirect happens.
 ///                 If Meesho asks for a captcha or SMS-OTP the sheet is already
 ///                 on screen, so the person just finishes it.
-///   * [apiPost] — runs `fetch()` inside a hidden WebView. The request carries
+///   * [apiCall] — runs `fetch()` inside a hidden WebView. The request carries
 ///                 the real cookies and browser fingerprint, so the WAF leaves
 ///                 it alone. A fetch is just an XHR — well under a second.
 ///
@@ -83,71 +83,180 @@ class WebSession {
     );
   }
 
-  /// POSTs to a Meesho API path from inside the hidden WebView, with [cookies]
-  /// installed for the duration. Returns the decoded JSON.
-  static Future<dynamic> apiPost(
+  /// Calls a Meesho API path from inside the hidden WebView, with [cookies]
+  /// installed for the duration. Tries the request shapes Meesho is known to
+  /// accept and returns the first decoded JSON body that comes back 200.
+  static Future<dynamic> apiCall(
     List<Map<String, String>> cookies,
     String path, {
-    Map<String, dynamic> body = const {},
+    Map<String, dynamic>? body,
     void Function(List<Map<String, String>>)? onCookies,
   }) {
     return _lock.run(() async {
       await _installCookies(cookies);
       final c = await _ensureHeadless();
 
-      // Make sure the document is on the Meesho origin so fetch() is same-origin.
+      // fetch() must run from a document on the Meesho origin.
       final current = (await c.getUrl())?.toString() ?? '';
       if (!current.startsWith(base)) {
         await c.loadUrl(urlRequest: URLRequest(url: WebUri(loginUrl)));
-        await Future.delayed(const Duration(milliseconds: 1500));
+        await Future.delayed(const Duration(milliseconds: 1800));
       }
 
-      final js = '''
-var res = await fetch(${jsonEncode(base + path)}, {
-  method: 'POST',
-  credentials: 'include',
-  headers: { 'Content-Type': 'application/json', 'Accept': 'application/json, text/plain, */*' },
-  body: ${jsonEncode(jsonEncode(body))}
-});
-var text = await res.text();
-return JSON.stringify({ status: res.status, body: text });
-''';
-      final raw = await c.callAsyncJavaScript(functionBody: js);
+      final attempts = <String, String>{
+        if (body != null) 'POST+body': _fetchJs(path, 'POST', jsonEncode(body)),
+        'POST+empty': _fetchJs(path, 'POST', '{}'),
+        'GET': _fetchJs(path, 'GET', null),
+      };
+
+      final log = StringBuffer();
+      log.writeln(path);
+      dynamic good;
+
+      for (final a in attempts.entries) {
+        final raw = await c.callAsyncJavaScript(functionBody: a.value);
+        final value = raw?.value;
+        if (value == null) {
+          log.writeln('  ${a.key} -> no response');
+          continue;
+        }
+        Map<String, dynamic> env;
+        try {
+          env = jsonDecode('$value') as Map<String, dynamic>;
+        } catch (_) {
+          log.writeln('  ${a.key} -> unreadable: $value');
+          continue;
+        }
+        final status = env['status'];
+        final text = '${env['body'] ?? ''}';
+        final short = text.length > 700 ? '${text.substring(0, 700)}...' : text;
+        log.writeln('  ${a.key} -> HTTP $status  $short');
+
+        if (status == 200) {
+          try {
+            good = jsonDecode(text);
+          } catch (_) {
+            good = text;
+          }
+          break;
+        }
+      }
+
+      lastDebug = log.toString();
       onCookies?.call(await dumpCookies());
 
-      final value = raw?.value;
-      if (value == null) {
-        lastDebug = 'POST $path → no response from WebView';
-        throw Exception('No response');
+      if (good == null) {
+        final t = log.toString();
+        if (t.contains('HTTP 401') || t.contains('HTTP 403')) throw SessionExpired();
+        throw Exception('No usable response - see Settings, Session diagnostics');
       }
-      Map<String, dynamic> env;
-      try {
-        env = jsonDecode('$value') as Map<String, dynamic>;
-      } catch (_) {
-        lastDebug = 'POST $path → unreadable: $value';
-        throw Exception('Unreadable response');
-      }
-      final status = env['status'];
-      final text = '${env['body'] ?? ''}';
-      lastDebug = 'POST $path → HTTP $status\n'
-          '${text.length > 2500 ? '${text.substring(0, 2500)}…' : text}';
-      if (status == 401 || status == 403) throw SessionExpired();
-      try {
-        return jsonDecode(text);
-      } catch (_) {
-        return text;
-      }
+      return good;
     });
   }
 
+  static String _fetchJs(String path, String method, String? body) {
+    final url = jsonEncode(base + path);
+    final m = jsonEncode(method);
+    final bodyPart = body == null ? '' : ', body: ${jsonEncode(body)}';
+    return "var res = await fetch($url, {"
+        "method: $m,"
+        "credentials: 'include',"
+        "headers: {'Content-Type': 'application/json', 'Accept': 'application/json, text/plain, */*'}"
+        "$bodyPart"
+        "});"
+        "var text = await res.text();"
+        "return JSON.stringify({ status: res.status, body: text });";
+  }
+
   // ------------------------------------------------------------------- login
-  /// Opens the login sheet and returns the account's cookies.
+  /// Logs in and returns that account's cookies.
+  ///
+  /// Runs hidden first. Only if Meesho throws up a captcha / SMS-OTP step does
+  /// the visible sheet open, so the person can finish it.
   static Future<List<Map<String, String>>> login({
     required String email,
     required String password,
-  }) {
+  }) async {
+    try {
+      return await _lock.run(() => _headlessLogin(email, password));
+    } on _NeedsUser {
+      return _sheetLogin(email, password);
+    }
+  }
+
+  /// Silent login in a throwaway headless WebView.
+  static Future<List<Map<String, String>>> _headlessLogin(String email, String password) async {
+    await _cookieMgr.deleteAllCookies();
+    final log = StringBuffer();
+    log.writeln('hidden login for $email');
+
+    InAppWebViewController? ctl;
+    final started = Completer<void>();
+    final hw = HeadlessInAppWebView(
+      initialUrlRequest: URLRequest(url: WebUri(loginUrl)),
+      initialSettings: InAppWebViewSettings(
+        javaScriptEnabled: true,
+        thirdPartyCookiesEnabled: true,
+        userAgent: _ua,
+      ),
+      onWebViewCreated: (c) => ctl = c,
+      onLoadStop: (c, url) {
+        log.writeln('loaded $url');
+        if (!started.isCompleted) started.complete();
+      },
+    );
+
+    try {
+      await hw.run();
+      await started.future.timeout(const Duration(seconds: 30));
+
+      var filled = false;
+      for (var elapsed = 0; elapsed < 75000; elapsed += 1200) {
+        await Future.delayed(const Duration(milliseconds: 1200));
+        final c = ctl;
+        if (c == null) continue;
+
+        final url = (await c.getUrl())?.toString() ?? '';
+        if (url.isNotEmpty && !_isLoginUrl(url)) {
+          await Future.delayed(const Duration(milliseconds: 1600));
+          final cookies = await dumpCookies();
+          log.writeln('landed on $url with ${cookies.length} cookie(s)');
+          lastDebug = log.toString();
+          if (cookies.isEmpty) throw Exception('Logged in but no cookies were set');
+          return cookies;
+        }
+
+        if (!filled) {
+          final r = await c.evaluateJavascript(source: fillScript(email, password));
+          log.writeln('fill -> $r');
+          if ('$r'.contains('submitted')) filled = true;
+          continue;
+        }
+
+        final state = await c.evaluateJavascript(source: stateScript);
+        final st = '$state';
+        if (st.contains('wrong')) {
+          log.writeln('Meesho rejected the credentials');
+          lastDebug = log.toString();
+          throw Exception('Wrong email or password');
+        }
+        if (st.contains('challenge')) {
+          log.writeln('captcha / SMS-OTP step - handing over to the visible sheet');
+          lastDebug = log.toString();
+          throw _NeedsUser();
+        }
+      }
+      log.writeln('timed out on the login page');
+      lastDebug = log.toString();
+      throw _NeedsUser();
+    } finally {
+      await hw.dispose();
+    }
+  }
+
+  /// Visible fallback — used only when Meesho asks for something a human must do.
+  static Future<List<Map<String, String>>> _sheetLogin(String email, String password) {
     return _lock.run(() async {
-      await _cookieMgr.deleteAllCookies();
       final ctx = navigatorKey.currentContext;
       if (ctx == null) throw Exception('App is not ready yet');
       final cookies = await showModalBottomSheet<List<Map<String, String>>>(
@@ -162,14 +271,49 @@ return JSON.stringify({ status: res.status, body: text });
         builder: (_) => _LoginSheet(email: email, password: password),
       );
       if (cookies == null || cookies.isEmpty) {
-        throw Exception(lastDebug == null
-            ? 'Login cancelled'
-            : 'Login did not complete — see Settings → Diagnostics');
+        throw Exception('Login did not complete - see Settings, Session diagnostics');
       }
       return cookies;
     });
   }
+
+  static bool _isLoginUrl(String url) =>
+      url.contains('/login') ||
+      url.contains('/signin') ||
+      RegExp(r'/root/?$').hasMatch(url);
+
+  static const _ua = 'Mozilla/5.0 (Linux; Android 14; SM-S918B) AppleWebKit/537.36 '
+      '(KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36';
+
+  /// JS that fills the Meesho login form and presses the button.
+  static String fillScript(String email, String password) {
+    final e = jsonEncode(email);
+    final p = jsonEncode(password);
+    return "(function(){try{"
+        "var pass=document.querySelector('input[type=\"password\"]');"
+        "var mail=document.querySelector('input[name=\"emailOrPhone\"]')||document.querySelector('input[type=\"email\"]')||document.querySelector('input[type=\"text\"]');"
+        "if(!pass||!mail)return 'no-form';"
+        "function setVal(el,v){var s=Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype,'value').set;"
+        "s.call(el,v);el.dispatchEvent(new Event('input',{bubbles:true}));el.dispatchEvent(new Event('change',{bubbles:true}));}"
+        "mail.focus();setVal(mail,$e);pass.focus();setVal(pass,$p);"
+        "var btn=document.querySelector('button[type=\"submit\"]');"
+        "if(!btn){var all=Array.prototype.slice.call(document.querySelectorAll('button'));"
+        "btn=all.filter(function(b){return /log ?in|sign ?in/i.test(b.textContent);})[0];}"
+        "if(!btn)return 'no-button';"
+        "if(btn.disabled)return 'button-disabled';"
+        "btn.click();return 'submitted';"
+        "}catch(err){return 'error: '+err.message;}})();";
+  }
+
+  /// JS that reports what the login page is currently showing.
+  static const stateScript = "(function(){var t=(document.body.innerText||'').toLowerCase();"
+      "if(/invalid|incorrect|wrong password|not registered/.test(t))return 'wrong';"
+      "if(/enter otp|verification code|otp sent|captcha|verify/.test(t))return 'challenge';"
+      "return 'waiting';})();";
 }
+
+/// Raised when Meesho needs a human (captcha / SMS-OTP).
+class _NeedsUser implements Exception {}
 
 class SessionExpired implements Exception {
   @override
@@ -191,7 +335,7 @@ class _LoginSheetState extends State<_LoginSheet> {
   bool _filled = false;
   bool _needsUser = false;
   int _elapsed = 0;
-  String _status = 'Opening Meesho…';
+  String _status = 'Meesho needs a quick check — please finish it below';
   final _log = StringBuffer();
 
   @override
@@ -226,7 +370,7 @@ class _LoginSheetState extends State<_LoginSheet> {
       }
 
       if (!_filled) {
-        final r = await c.evaluateJavascript(source: _fillScript());
+        final r = await c.evaluateJavascript(source: WebSession.fillScript(widget.email, widget.password));
         _log.writeln('fill → $r');
         if ('$r'.contains('submitted')) {
           _filled = true;
@@ -235,7 +379,7 @@ class _LoginSheetState extends State<_LoginSheet> {
         return;
       }
 
-      final state = await c.evaluateJavascript(source: _stateScript);
+      final state = await c.evaluateJavascript(source: WebSession.stateScript);
       final s = '$state';
       if (s.contains('wrong')) {
         t.cancel();
@@ -258,53 +402,11 @@ class _LoginSheetState extends State<_LoginSheet> {
   bool _isLogin(String url) =>
       url.contains('/login') || url.contains('/signin') || RegExp(r'/root/?$').hasMatch(url);
 
-  String _fillScript() {
-    final e = jsonEncode(widget.email);
-    final p = jsonEncode(widget.password);
-    return '''
-(function(){
-  try {
-    var pass = document.querySelector('input[type="password"]');
-    var mail = document.querySelector('input[name="emailOrPhone"]')
-            || document.querySelector('input[type="email"]')
-            || document.querySelector('input[type="text"]');
-    if (!pass || !mail) return 'no-form';
-    function setVal(el, v) {
-      var setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
-      setter.call(el, v);
-      el.dispatchEvent(new Event('input', {bubbles: true}));
-      el.dispatchEvent(new Event('change', {bubbles: true}));
-    }
-    mail.focus(); setVal(mail, $e);
-    pass.focus(); setVal(pass, $p);
-    var btn = document.querySelector('button[type="submit"]');
-    if (!btn) {
-      var all = Array.prototype.slice.call(document.querySelectorAll('button'));
-      btn = all.filter(function(b){ return /log ?in|sign ?in/i.test(b.textContent); })[0];
-    }
-    if (!btn) return 'no-button';
-    if (btn.disabled) return 'button-disabled';
-    btn.click();
-    return 'submitted';
-  } catch (err) { return 'error: ' + err.message; }
-})();
-''';
-  }
-
-  static const _stateScript = '''
-(function(){
-  var t = (document.body.innerText || '').toLowerCase();
-  if (/invalid|incorrect|wrong password|not registered/.test(t)) return 'wrong';
-  if (/enter otp|verification code|otp sent|captcha|verify/.test(t)) return 'challenge';
-  return 'waiting';
-})();
-''';
-
   @override
   Widget build(BuildContext context) {
     final h = MediaQuery.of(context).size.height;
     return SizedBox(
-      height: _needsUser ? h * .9 : h * .5,
+      height: h * .9,
       child: Column(
         children: [
           Container(
@@ -320,14 +422,7 @@ class _LoginSheetState extends State<_LoginSheet> {
             padding: const EdgeInsets.symmetric(horizontal: 18),
             child: Row(
               children: [
-                if (!_needsUser)
-                  const SizedBox(
-                    width: 18,
-                    height: 18,
-                    child: CircularProgressIndicator(strokeWidth: 2.4, color: AppColors.blue),
-                  )
-                else
-                  const Icon(Icons.touch_app_rounded, size: 20, color: AppColors.warn),
+                const Icon(Icons.touch_app_rounded, size: 20, color: AppColors.warn),
                 const SizedBox(width: 10),
                 Expanded(
                   child: Text(
@@ -344,9 +439,7 @@ class _LoginSheetState extends State<_LoginSheet> {
           ),
           const SizedBox(height: 8),
           Expanded(
-            child: Opacity(
-              // Hidden while it auto-fills; revealed if Meesho asks for a captcha.
-              opacity: _needsUser ? 1 : 0.01,
+            child: ClipRRect(
               child: InAppWebView(
                 initialUrlRequest: URLRequest(url: WebUri(WebSession.loginUrl)),
                 initialSettings: InAppWebViewSettings(
