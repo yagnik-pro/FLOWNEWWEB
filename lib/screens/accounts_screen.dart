@@ -45,6 +45,42 @@ class _AccountsScreenState extends State<AccountsScreen> {
     }
   }
 
+  Future<void> _rename(Account a) async {
+    final ctl = TextEditingController(text: a.name);
+    final name = await showDialog<String>(
+      context: context,
+      builder: (_) => AlertDialog(
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(18)),
+        title: const Text('Store name'),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            TextField(
+              controller: ctl,
+              autofocus: true,
+              decoration: const InputDecoration(hintText: 'e.g. Sparrow Prime'),
+            ),
+            const SizedBox(height: 10),
+            const Text(
+              'Leave it empty to let OTP Flow read the name from your Meesho panel again.',
+              style: TextStyle(fontSize: 12, color: AppColors.ink2),
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(context), child: const Text('Cancel')),
+          FilledButton(
+            style: FilledButton.styleFrom(backgroundColor: AppColors.blue),
+            onPressed: () => Navigator.pop(context, ctl.text),
+            child: const Text('Save'),
+          ),
+        ],
+      ),
+    );
+    if (name != null) await store.renameAccount(a, name);
+  }
+
   Future<void> _confirmDelete(Account a) async {
     final yes = await showDialog<bool>(
       context: context,
@@ -236,23 +272,37 @@ class _AccountsScreenState extends State<AccountsScreen> {
             onChanged: (v) => setState(() => v == true ? _selected.add(a.id) : _selected.remove(a.id)),
           ),
           Expanded(
-            child: Padding(
-              padding: const EdgeInsets.symmetric(vertical: 10),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Text(a.name, style: const TextStyle(fontWeight: FontWeight.w800, fontSize: 15)),
-                  const SizedBox(height: 1),
-                  Text(a.email, style: const TextStyle(fontSize: 11.8, color: AppColors.ink2, fontWeight: FontWeight.w600),
-                      maxLines: 1, overflow: TextOverflow.ellipsis),
-                  if (a.lastError != null)
-                    Padding(
-                      padding: const EdgeInsets.only(top: 3),
-                      child: Text(a.lastError!,
-                          style: const TextStyle(fontSize: 11.3, color: AppColors.danger, fontWeight: FontWeight.w600),
-                          maxLines: 2, overflow: TextOverflow.ellipsis),
+            child: InkWell(
+              onTap: () => _rename(a),
+              child: Padding(
+                padding: const EdgeInsets.symmetric(vertical: 10),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Row(
+                      children: [
+                        Flexible(
+                          child: Text(a.name,
+                              style: const TextStyle(fontWeight: FontWeight.w800, fontSize: 15),
+                              maxLines: 1, overflow: TextOverflow.ellipsis),
+                        ),
+                        const SizedBox(width: 5),
+                        const Icon(Icons.edit_outlined, size: 14, color: AppColors.ink2),
+                      ],
                     ),
-                ],
+                    const SizedBox(height: 1),
+                    Text(a.email,
+                        style: const TextStyle(fontSize: 11.8, color: AppColors.ink2, fontWeight: FontWeight.w600),
+                        maxLines: 1, overflow: TextOverflow.ellipsis),
+                    if (a.lastError != null)
+                      Padding(
+                        padding: const EdgeInsets.only(top: 3),
+                        child: Text(a.lastError!,
+                            style: const TextStyle(fontSize: 11.3, color: AppColors.danger, fontWeight: FontWeight.w600),
+                            maxLines: 2, overflow: TextOverflow.ellipsis),
+                      ),
+                  ],
+                ),
               ),
             ),
           ),
