@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:collection';
 import 'dart:convert';
 
 import 'package:flutter/material.dart';
@@ -271,6 +272,176 @@ class WebSession {
         "return JSON.stringify({ status: -1, len: 0, body: 'JS error: ' + (e && e.message ? e.message : String(e)) });"
         "}";
   }
+
+  /// True when a decoded payload actually carries courier/OTP pairs, so we
+  /// don't latch onto some unrelated 200 the page happened to make.
+  static bool _looksLikeOtps(dynamic node, [int depth = 0]) {
+    if (depth > 8 || node == null) return false;
+    if (node is List) {
+      for (final v in node) {
+        if (_looksLikeOtps(v, depth + 1)) return true;
+      }
+      return false;
+    }
+    if (node is! Map) return false;
+    final keys = node.keys.map((k) => k.toString().toLowerCase()).toSet();
+    const otpKeys = {
+      'otp_code', 'supplier_delivery_otp', 'delivery_otp', 'otp',
+      'admin_lock_otp', 'end_otp', 'return_otp',
+    };
+    if (keys.any(otpKeys.contains)) return true;
+    for (final v in node.values) {
+      if (_looksLikeOtps(v, depth + 1)) return true;
+    }
+    return false;
+  }
+
+  // ======================================================= panel interception
+  /// Injected before any page script runs. It wraps `fetch` and `XMLHttpRequest`
+  /// so every returns-related call the panel makes — request body and response —
+  /// lands in `window.__otpflow`.
+  static const _hookJs = "(function(){"
+      "if(window.__otpflow)return;"
+      "window.__otpflow=[];"
+      "function keep(u){return /fetchDeliveryOTPs|returnRto|fetchOverview/i.test(u||'');}"
+      "var of=window.fetch;"
+      "window.fetch=function(){"
+      "var a=arguments;"
+      "var u=(a[0]&&a[0].url)?a[0].url:String(a[0]);"
+      "var rb='';try{rb=(a[1]&&a[1].body)?String(a[1].body):'';}catch(e){}"
+      "return of.apply(this,a).then(function(res){"
+      "try{if(keep(u)){res.clone().text().then(function(t){"
+      "window.__otpflow.push({url:u,status:res.status,req:rb,body:t});"
+      "}).catch(function(){});}}catch(e){}"
+      "return res;});};"
+      "var oo=XMLHttpRequest.prototype.open,os=XMLHttpRequest.prototype.send;"
+      "XMLHttpRequest.prototype.open=function(m,u){this.__u=u;this.__m=m;return oo.apply(this,arguments);};"
+      "XMLHttpRequest.prototype.send=function(b){var s=this;"
+      "this.addEventListener('load',function(){try{if(keep(s.__u)){"
+      "window.__otpflow.push({url:s.__u,status:s.status,req:b?String(b):'',body:s.responseText});"
+      "}}catch(e){}});"
+      "return os.apply(this,arguments);};"
+      "})();";
+
+  /// Opens the panel's own Returns page and returns whatever its OTP call
+  /// received. No payload guessing — the panel builds the request itself.
+  static Future<dynamic> fetchOtpsViaPanel(
+    List<Map<String, String>> cookies,
+    String identifier, {
+    void Function(List<Map<String, String>>)? onCookies,
+  }) {
+    return _lock.run(() async {
+      await _installCookies(cookies);
+
+      final log = StringBuffer();
+      log.writeln('panel returns page  identifier=$identifier');
+
+      InAppWebViewController? ctl;
+      final hw = HeadlessInAppWebView(
+        initialUrlRequest: URLRequest(
+          url: WebUri('$base/panel/v3/new/fulfillment/$identifier/returns/overview'),
+        ),
+        initialSettings: InAppWebViewSettings(
+          javaScriptEnabled: true,
+          thirdPartyCookiesEnabled: true,
+          userAgent: ua,
+        ),
+        initialUserScripts: UnmodifiableListView<UserScript>([
+          UserScript(source: _hookJs, injectionTime: UserScriptInjectionTime.AT_DOCUMENT_START),
+        ]),
+        onWebViewCreated: (c) => ctl = c,
+      );
+
+      try {
+        await hw.run();
+        dynamic captured;
+
+        for (var i = 0; i < 25; i++) {
+          await Future.delayed(const Duration(milliseconds: 800));
+          final c = ctl;
+          if (c == null) continue;
+
+          final url = (await c.getUrl())?.toString() ?? '';
+          if (isLoginUrl(url)) {
+            log.writeln('bounced to the login page - session is dead');
+            _record(log.toString());
+            throw SessionExpired();
+          }
+
+          final raw = await c.evaluateJavascript(
+              source: "JSON.stringify(window.__otpflow || [])");
+          if (raw == null) continue;
+          List<dynamic> entries;
+          try {
+            entries = jsonDecode('$raw') as List<dynamic>;
+          } catch (_) {
+            continue;
+          }
+          if (entries.isEmpty) continue;
+
+          for (final e in entries) {
+            final m = Map<String, dynamic>.from(e as Map);
+            final status = m['status'];
+            final body = '${m['body'] ?? ''}';
+            final req = '${m['req'] ?? ''}';
+            final shortReq = req.length > 200 ? '${req.substring(0, 200)}...' : req;
+            final shortBody = body.length > 400 ? '${body.substring(0, 400)}...' : body;
+            log.writeln('  ${m['url']} -> HTTP $status');
+            if (shortReq.isNotEmpty) log.writeln('    request: $shortReq');
+            log.writeln('    response: $shortBody');
+
+            if (status == 200 && body.isNotEmpty) {
+              try {
+                final decoded = jsonDecode(body);
+                if (_looksLikeOtps(decoded)) {
+                  captured = decoded;
+                }
+              } catch (_) {}
+            }
+          }
+          if (captured != null) break;
+        }
+
+        // Nudge the page: the OTP list sometimes only loads when opened.
+        if (captured == null && ctl != null) {
+          await ctl!.evaluateJavascript(source: _clickMoreOtps);
+          await Future.delayed(const Duration(seconds: 3));
+          final raw = await ctl!.evaluateJavascript(
+              source: "JSON.stringify(window.__otpflow || [])");
+          try {
+            for (final e in (jsonDecode('$raw') as List<dynamic>)) {
+              final m = Map<String, dynamic>.from(e as Map);
+              final body = '${m['body'] ?? ''}';
+              if (m['status'] == 200 && body.isNotEmpty) {
+                final decoded = jsonDecode(body);
+                if (_looksLikeOtps(decoded)) {
+                  captured = decoded;
+                  log.writeln('  captured after opening "More OTPs"');
+                  break;
+                }
+              }
+            }
+          } catch (_) {}
+        }
+
+        _record(log.toString());
+        onCookies?.call(await dumpCookies());
+
+        if (captured == null) {
+          throw Exception('Panel did not return OTP data - see Settings, Session diagnostics');
+        }
+        return captured;
+      } finally {
+        await hw.dispose();
+      }
+    });
+  }
+
+  static const _clickMoreOtps = "(function(){try{"
+      "var els=Array.prototype.slice.call(document.querySelectorAll('span,div,p,a,button'));"
+      "var m=els.filter(function(e){return /More OTPs/i.test(e.textContent)&&e.offsetParent!==null;})[0];"
+      "if(m){m.click();return 'clicked';}return 'not-found';"
+      "}catch(e){return 'err';}})();";
 
   // =================================================================== login
   /// Logs in and returns the account's cookies plus its identifier.
