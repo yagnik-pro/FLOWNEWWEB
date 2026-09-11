@@ -1,0 +1,145 @@
+name: Build OTP Flow APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main, master ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: 'zulu'
+          java-version: '17'
+
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.24.5'
+          channel: stable
+
+      - name: Show what the repo actually contains
+        run: |
+          echo "=== root ==="; ls -la
+          echo "=== lib ==="; ls -R lib || echo "!! lib/ MISSING"
+          echo "=== assets ==="; ls -R assets || echo "!! assets/ MISSING"
+          test -f pubspec.yaml || { echo "!! pubspec.yaml MISSING"; exit 1; }
+          test -d lib || { echo "!! lib/ MISSING - upload it to the repo"; exit 1; }
+
+      - name: Create Android project shell
+        run: flutter create --platforms=android --org com.otpflow --project-name otpflow .
+
+      - name: Restore custom AndroidManifest
+        run: |
+          if [ -f android_overrides/AndroidManifest.xml ]; then
+            cp android_overrides/AndroidManifest.xml android/app/src/main/AndroidManifest.xml
+            echo "custom manifest applied"
+          fi
+
+      - name: Patch app gradle - minSdk and desugaring
+        run: |
+          set -e
+          python3 - <<'PY'
+          import re, os
+          gk = 'android/app/build.gradle.kts'
+          gg = 'android/app/build.gradle'
+          if os.path.exists(gk):
+              p = gk; s = open(p).read()
+              s = s.replace('minSdk = flutter.minSdkVersion', 'minSdk = 23')
+              if 'isCoreLibraryDesugaringEnabled' not in s:
+                  s = re.sub(r'(compileOptions\s*\{)', r'\1\n        isCoreLibraryDesugaringEnabled = true', s, count=1)
+              if 'coreLibraryDesugaring' not in s:
+                  s = s.rstrip() + '\n\ndependencies {\n    coreLibraryDesugaring("com.android.tools:desugar_jdk_libs:2.1.4")\n}\n'
+          elif os.path.exists(gg):
+              p = gg; s = open(p).read()
+              s = s.replace('minSdkVersion flutter.minSdkVersion', 'minSdkVersion 23')
+              if 'coreLibraryDesugaringEnabled' not in s:
+                  s = re.sub(r'(compileOptions\s*\{)', r'\1\n        coreLibraryDesugaringEnabled true', s, count=1)
+              if 'coreLibraryDesugaring ' not in s:
+                  s = s.rstrip() + "\n\ndependencies {\n    coreLibraryDesugaring 'com.android.tools:desugar_jdk_libs:2.1.4'\n}\n"
+          else:
+              raise SystemExit('no app gradle file found')
+          open(p, 'w').write(s)
+          print('patched', p)
+          print(open(p).read())
+          PY
+
+      - run: flutter pub get
+
+      - name: Analyze Dart code
+        run: |
+          flutter analyze --no-fatal-infos --no-fatal-warnings 2>&1 | tee analyze.txt || true
+          # Surface every real error as a GitHub annotation so it shows up on the
+          # run summary page instead of being buried in the log.
+          grep -E "error [-•]" analyze.txt | while IFS= read -r line; do
+            echo "::error::$line"
+          done
+          if grep -qE "error [-•]" analyze.txt; then
+            echo "Dart errors above - fix these first."
+            exit 1
+          fi
+          echo "No Dart errors."
+
+      - name: Add namespace to plugins missing it
+        run: |
+          python3 - <<'PY'
+          import os, re, glob
+          root = os.path.expanduser('~/.pub-cache/hosted')
+          fixed = 0
+          for gradle in glob.glob(os.path.join(root, '*', '*', 'android', 'build.gradle')):
+              try:
+                  s = open(gradle).read()
+              except Exception:
+                  continue
+              if 'namespace' in s:
+                  continue
+              m = re.search(r'package\s*=\s*["\']([\w\.]+)["\']', s)
+              if not m:
+                  mf = os.path.join(os.path.dirname(gradle), 'src', 'main', 'AndroidManifest.xml')
+                  if os.path.exists(mf):
+                      m = re.search(r'package\s*=\s*"([\w\.]+)"', open(mf).read())
+              if not m:
+                  continue
+              pkg = m.group(1)
+              s2 = re.sub(r'(android\s*\{)', r'\1\n    namespace "%s"' % pkg, s, count=1)
+              if s2 != s:
+                  open(gradle, 'w').write(s2)
+                  fixed += 1
+                  print('namespace added:', pkg)
+          print('plugins patched:', fixed)
+          PY
+
+      - name: Generate launcher icons
+        continue-on-error: true
+        run: |
+          if [ ! -f assets/images/logo.png ]; then echo "no logo, skipping"; exit 0; fi
+          sudo apt-get update -qq && sudo apt-get install -y imagemagick
+          for d in mdpi:48 hdpi:72 xhdpi:96 xxhdpi:144 xxxhdpi:192; do
+            name=${d%%:*}; size=${d##*:}
+            mkdir -p android/app/src/main/res/mipmap-$name
+            convert assets/images/logo.png -resize ${size}x${size} android/app/src/main/res/mipmap-$name/ic_launcher.png || \
+            magick assets/images/logo.png -resize ${size}x${size} android/app/src/main/res/mipmap-$name/ic_launcher.png || true
+          done
+
+      - name: Build APK
+        run: flutter build apk --release --no-tree-shake-icons
+
+      - name: Diagnostics if build failed
+        if: failure()
+        run: |
+          flutter build apk --release 2>&1 | tee err.txt || true
+          grep -iE "^(e:|error:|FAILURE|Execution failed|Caused by|\\* What went wrong)" err.txt | head -20 | while IFS= read -r line; do
+            echo "::error::$line"
+          done
+          echo "===== last 120 lines ====="
+          tail -n 120 err.txt || true
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: OTPFlow-APK
+          path: build/app/outputs/flutter-apk/app-release.apk
+          retention-days: 30
