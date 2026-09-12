@@ -21,6 +21,10 @@ class AppStore extends ChangeNotifier {
   bool notifyOnNew = true;
   bool backgroundEnabled = true;
 
+  /// Set once Meesho's WAF starts refusing hand-made API calls. Reset on every
+  /// app start, so a change on their side is picked up without a reinstall.
+  bool apiBlocked = false;
+
   bool busy = false;
   String? busyLabel;
   Timer? _timer;
@@ -200,6 +204,7 @@ class AppStore extends ChangeNotifier {
       final r = await WebSession.login(email: a.email, password: a.password);
       a.cookies = r.cookies;
       if (r.identifier.isNotEmpty) a.identifier = r.identifier;
+      if (r.storeName.isNotEmpty && a.autoName) a.name = r.storeName;
       a.lastLogin = DateTime.now().millisecondsSinceEpoch;
       a.status = AccStatus.ok;
       return null;
@@ -232,38 +237,51 @@ class AppStore extends ChangeNotifier {
       // Hand-made calls to this endpoint return 500 - the payload it wants is
       // not something worth guessing at. The same pass also picks up the store
       // name straight off the page.
+      // The API is far quicker, so try it while it lasts. Meesho's WAF has
+      // started answering hand-made calls with an Akamai "Access Denied";
+      // once that happens we stop wasting a few seconds on it every refresh
+      // and read the Returns page instead.
       dynamic data;
-      try {
-        final r = await WebSession.fetchOtpsViaPanel(
+      var gotFromApi = false;
+      if (!apiBlocked) {
+        try {
+          data = await WebSession.apiCall(
+            a.cookies,
+            '/api/fulfillment/returnRto/fetchDeliveryOTPs',
+            identifier: a.identifier,
+            onCookies: (c) {
+              if (c.isNotEmpty) a.cookies = c;
+            },
+          );
+          gotFromApi = true;
+        } on SessionExpired {
+          rethrow;
+        } catch (_) {
+          apiBlocked = true;
+        }
+      }
+
+      if (!gotFromApi) {
+        final panel = await WebSession.fetchOtpsViaPanel(
           a.cookies,
           a.identifier,
           onCookies: (c) {
             if (c.isNotEmpty) a.cookies = c;
           },
         );
-        data = r.otpData;
-        if (r.storeName.isNotEmpty && a.autoName) a.name = r.storeName;
-      } on SessionExpired {
-        rethrow;
-      } catch (_) {
-        // Fallback: direct API call, in case the page layout changed.
-        data = await WebSession.apiCall(
-          a.cookies,
-          '/api/fulfillment/returnRto/fetchDeliveryOTPs',
-          identifier: a.identifier,
-          onCookies: (c) {
-            if (c.isNotEmpty) a.cookies = c;
-          },
-        );
+        data = panel.otpData;
+        if (panel.storeName.isNotEmpty && a.autoName) a.name = panel.storeName;
       }
 
       a.otps = MeeshoApi.parseOtps(data);
       a.fetchedAt = DateTime.now().millisecondsSinceEpoch;
       a.status = AccStatus.ok;
+      // An empty list from a page that rendered fine just means nothing is
+      // pending right now — that is an answer, not a failure.
       a.lastError = null;
-      if (a.otps.isEmpty) {
+      if (a.otps.isEmpty && !panel.pageReady) {
         MeeshoApi.lastRawResponse = WebSession.lastDebug;
-        a.lastError = 'Logged in, but no OTPs in the response - see Settings, Session diagnostics';
+        a.lastError = 'Could not read the Returns page - see Settings, Session diagnostics';
       }
 
       if (a.autoName && a.name.contains('@')) {
