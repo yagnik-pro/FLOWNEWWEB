@@ -13,14 +13,32 @@ import '../theme.dart';
 class LoginResult {
   final List<Map<String, String>> cookies;
   final String identifier;
-  const LoginResult({required this.cookies, required this.identifier});
+
+  /// Read off the panel's home page the moment the login lands there, so the
+  /// name is saved once instead of being chased on every refresh.
+  final String storeName;
+
+  const LoginResult({
+    required this.cookies,
+    required this.identifier,
+    this.storeName = '',
+  });
 }
 
 /// What one pass over the panel's Returns page yields.
 class PanelResult {
   final dynamic otpData;
   final String storeName;
-  const PanelResult({required this.otpData, required this.storeName});
+
+  /// True when the Returns page rendered. An empty [otpData] with this set
+  /// means there simply are no OTPs pending — not that anything failed.
+  final bool pageReady;
+
+  const PanelResult({
+    required this.otpData,
+    required this.storeName,
+    this.pageReady = false,
+  });
 }
 
 class SessionExpired implements Exception {
@@ -280,102 +298,82 @@ class WebSession {
         "}";
   }
 
-  /// True when a decoded payload actually carries courier/OTP pairs, so we
-  /// don't latch onto some unrelated 200 the page happened to make.
-  static bool _looksLikeOtps(dynamic node, [int depth = 0]) {
-    if (depth > 8 || node == null) return false;
-    if (node is List) {
-      for (final v in node) {
-        if (_looksLikeOtps(v, depth + 1)) return true;
-      }
-      return false;
-    }
-    if (node is! Map) return false;
-    final keys = node.keys.map((k) => k.toString().toLowerCase()).toSet();
-    const otpKeys = {
-      'otp_code', 'supplier_delivery_otp', 'delivery_otp', 'otp',
-      'admin_lock_otp', 'end_otp', 'return_otp',
-    };
-    if (keys.any(otpKeys.contains)) return true;
-    for (final v in node.values) {
-      if (_looksLikeOtps(v, depth + 1)) return true;
-    }
-    return false;
-  }
-
-  /// Reads the store name straight off the panel. The API route for this keeps
-  /// returning 403, but the page shows the name in the sidebar header and in
-  /// the "Welcome back, X" greeting.
-  ///
-  /// Everything is validated before it is handed back: the sidebar also holds
-  /// icons, ellipses and loading placeholders, and those used to slip through.
-  static const _storeNameJs = "(function(){try{"
-      "function ok(s){"
-      "if(!s)return false;"
-      "s=s.trim();"
-      "if(s.length<2||s.length>60)return false;"
-      "var letters=s.replace(/[^A-Za-z\\u0900-\\u097F]/g,'');"
-      "if(letters.length<2)return false;"
-      "if(/^[.\\u2026\\s\\-_|]+$/.test(s))return false;"
-      "if(/^(loading|undefined|null|menu|notices|support)$/i.test(s))return false;"
-      "return true;}"
-      "var t=document.body.innerText||'';"
-      "var m=t.match(/Welcome back,\\s*([^\\n]{2,60})/i);"
-      "if(m&&ok(m[1]))return m[1].trim();"
-      "var sels=['aside','nav','[class*=\"sidebar\" i]','[class*=\"Sidebar\" i]','header'];"
-      "for(var i=0;i<sels.length;i++){"
-      "var el=document.querySelector(sels[i]);"
-      "if(!el)continue;"
-      "var lines=(el.innerText||'').split('\\n');"
-      "for(var j=0;j<lines.length;j++){"
-      "var L=lines[j].trim();"
-      "if(/notice|support|^home$|^orders?$|^returns?$|pricing|claim|inventory|catalog|quality|payment|warehouse|service|menu|advertis|promotion|influencer|instant cash|pay later/i.test(L))continue;"
-      "if(ok(L))return L;}}"
-      "for(var k=0;k<localStorage.length;k++){"
-      "var key=localStorage.key(k);var v=localStorage.getItem(key)||'';"
-      "var n=v.match(/\"(?:supplier_name|business_name|shop_name|store_name|name)\"\\s*:\\s*\"([^\"]{2,60})\"/);"
-      "if(n&&ok(n[1]))return n[1];}"
-      "return '';"
-      "}catch(e){return '';}})();";
-
-  /// Same validation on the Dart side, so nothing odd reaches the UI.
-  static bool looksLikeStoreName(String s) {
-    final v = s.trim();
-    if (v.length < 2 || v.length > 60) return false;
-    if (v.toLowerCase() == 'null' || v.toLowerCase() == 'undefined') return false;
-    final letters = RegExp(r'[A-Za-z\u0900-\u097F]').allMatches(v).length;
-    return letters >= 2;
-  }
-
   // ======================================================= panel interception
-  /// Injected before any page script runs. It wraps `fetch` and `XMLHttpRequest`
-  /// so every returns-related call the panel makes — request body and response —
-  /// lands in `window.__otpflow`.
-  static const _hookJs = "(function(){"
-      "if(window.__otpflow)return;"
-      "window.__otpflow=[];"
-      "function keep(u){return /fetchDeliveryOTPs|returnRto|fetchOverview/i.test(u||'');}"
-      "var of=window.fetch;"
-      "window.fetch=function(){"
-      "var a=arguments;"
-      "var u=(a[0]&&a[0].url)?a[0].url:String(a[0]);"
-      "var rb='';try{rb=(a[1]&&a[1].body)?String(a[1].body):'';}catch(e){}"
-      "return of.apply(this,a).then(function(res){"
-      "try{if(keep(u)){res.clone().text().then(function(t){"
-      "window.__otpflow.push({url:u,status:res.status,req:rb,body:t});"
-      "}).catch(function(){});}}catch(e){}"
-      "return res;});};"
-      "var oo=XMLHttpRequest.prototype.open,os=XMLHttpRequest.prototype.send;"
-      "XMLHttpRequest.prototype.open=function(m,u){this.__u=u;this.__m=m;return oo.apply(this,arguments);};"
-      "XMLHttpRequest.prototype.send=function(b){var s=this;"
-      "this.addEventListener('load',function(){try{if(keep(s.__u)){"
-      "window.__otpflow.push({url:s.__u,status:s.status,req:b?String(b):'',body:s.responseText});"
-      "}}catch(e){}});"
-      "return os.apply(this,arguments);};"
-      "})();";
+  /// Injected before any page script runs. It wraps `fetch` and
+  /// `XMLHttpRequest` so every returns-related call the panel makes — request
+  /// body and response — lands in `window.__otpflow`.
+  static const _hookJs = r'''
+(function(){
+  if(window.__otpflow) return;
+  window.__otpflow = [];
+  function keep(u){ return /fetchDeliveryOTPs|returnRto|fetchOverview/i.test(u || ''); }
 
-  /// Opens the panel's own Returns page and returns whatever its OTP call
-  /// received. No payload guessing — the panel builds the request itself.
+  var of = window.fetch;
+  window.fetch = function(){
+    var a = arguments;
+    var u = (a[0] && a[0].url) ? a[0].url : String(a[0]);
+    var rb = '';
+    try { rb = (a[1] && a[1].body) ? String(a[1].body) : ''; } catch(e){}
+    return of.apply(this, a).then(function(res){
+      try {
+        if(keep(u)){
+          res.clone().text().then(function(t){
+            window.__otpflow.push({url: u, status: res.status, req: rb, body: t});
+          }).catch(function(){});
+        }
+      } catch(e){}
+      return res;
+    });
+  };
+
+  var oo = XMLHttpRequest.prototype.open, os = XMLHttpRequest.prototype.send;
+  XMLHttpRequest.prototype.open = function(m, u){ this.__u = u; this.__m = m; return oo.apply(this, arguments); };
+  XMLHttpRequest.prototype.send = function(b){
+    var s = this;
+    this.addEventListener('load', function(){
+      try {
+        if(keep(s.__u)){
+          window.__otpflow.push({url: s.__u, status: s.status, req: b ? String(b) : '', body: s.responseText});
+        }
+      } catch(e){}
+    });
+    return os.apply(this, arguments);
+  };
+})();
+''';
+
+  /// Parses the OTP widget out of the rendered page. The panel prints each
+  /// courier as "Delhivery OTP: 1375 / 4 Sept, 12:11 AM ... Total Handover
+  /// Count : 3", so we read what is on screen instead of calling the API —
+  /// Meesho's WAF blocks hand-made API calls, but it cannot block the page
+  /// rendering normally.
+  static const _readOtpsJs = r'''
+(function(){try{
+  var text = document.body.innerText || '';
+  var out = [];
+  var re = /([A-Za-z][A-Za-z ]{1,30}?)\s+OTP:\s*(\d{3,8})\s*([^\n]*)?\n[\s\S]*?Total Handover Count\s*:\s*(\d+)/g;
+  var m;
+  while((m = re.exec(text))){
+    var carrier = m[1].trim().replace(/\s+/g, ' ');
+    var otp = m[2];
+    if(out.some(function(o){ return o.carrier === carrier && o.otp === otp; })) continue;
+    out.push({
+      carrier: carrier,
+      otp: otp,
+      time: (m[3] || '').trim(),
+      count: parseInt(m[4], 10) || 0
+    });
+  }
+  var hasWidget = /OTP:/.test(text);
+  // Did the Returns page actually render? Used to tell "no OTPs today" apart
+  // from "the page never loaded".
+  var ready = /Return\s*\/\s*RTO Orders|Return Tracking|Claim Tracking|Total Handover Count|Customer Return/i.test(text)
+           || (text.length > 400 && /Returns/i.test(text));
+  return JSON.stringify({found: out.length, hasWidget: hasWidget, ready: ready, otps: out, sample: text.slice(0, 400)});
+}catch(e){ return JSON.stringify({found: 0, hasWidget: false, otps: [], sample: 'JS error: ' + e.message}); }})();
+''';
+
+  /// Opens the panel's Returns page and reads the OTPs off it.
   static Future<PanelResult> fetchOtpsViaPanel(
     List<Map<String, String>> cookies,
     String identifier, {
@@ -405,11 +403,14 @@ class WebSession {
 
       try {
         await hw.run();
-        dynamic captured;
+        List<dynamic> otps = const [];
         var storeName = '';
+        var clicked = false;
+        var pageReady = false;
+        var lastSample = '';
 
-        for (var i = 0; i < 25; i++) {
-          await Future.delayed(const Duration(milliseconds: 800));
+        for (var i = 0; i < 30; i++) {
+          await Future.delayed(const Duration(milliseconds: 900));
           final c = ctl;
           if (c == null) continue;
 
@@ -421,7 +422,7 @@ class WebSession {
           }
 
           if (storeName.isEmpty) {
-            final n = await c.evaluateJavascript(source: _storeNameJs);
+            final n = await c.evaluateJavascript(source: storeNameJs);
             final v = '${n ?? ''}'.trim();
             if (looksLikeStoreName(v)) {
               storeName = v;
@@ -429,80 +430,77 @@ class WebSession {
             }
           }
 
-          final raw = await c.evaluateJavascript(
-              source: "JSON.stringify(window.__otpflow || [])");
+          final raw = await c.evaluateJavascript(source: _readOtpsJs);
           if (raw == null) continue;
-          List<dynamic> entries;
+          Map<String, dynamic> res;
           try {
-            entries = jsonDecode('$raw') as List<dynamic>;
+            res = jsonDecode('$raw') as Map<String, dynamic>;
           } catch (_) {
             continue;
           }
-          if (entries.isEmpty) continue;
+          lastSample = '${res['sample'] ?? ''}';
+          final found = res['found'] ?? 0;
+          final hasWidget = res['hasWidget'] == true;
+          if (res['ready'] == true) pageReady = true;
 
-          for (final e in entries) {
-            final m = Map<String, dynamic>.from(e as Map);
-            final status = m['status'];
-            final body = '${m['body'] ?? ''}';
-            final req = '${m['req'] ?? ''}';
-            final shortReq = req.length > 200 ? '${req.substring(0, 200)}...' : req;
-            final shortBody = body.length > 400 ? '${body.substring(0, 400)}...' : body;
-            log.writeln('  ${m['url']} -> HTTP $status');
-            if (shortReq.isNotEmpty) log.writeln('    request: $shortReq');
-            log.writeln('    response: $shortBody');
-
-            if (status == 200 && body.isNotEmpty) {
-              try {
-                final decoded = jsonDecode(body);
-                if (_looksLikeOtps(decoded)) {
-                  captured = decoded;
-                }
-              } catch (_) {}
+          if (found is int && found > 0) {
+            otps = (res['otps'] as List<dynamic>?) ?? const [];
+            // The first courier renders before the rest; open the full list once.
+            if (!clicked) {
+              final r = await c.evaluateJavascript(source: _clickMoreOtps);
+              log.writeln('  more-otps -> $r');
+              clicked = true;
+              await Future.delayed(const Duration(milliseconds: 2200));
+              continue;
             }
+            log.writeln('  read $found OTP row(s) off the page');
+            break;
           }
-          if (captured != null) break;
+
+          if (hasWidget && !clicked) {
+            final r = await c.evaluateJavascript(source: _clickMoreOtps);
+            log.writeln('  more-otps -> $r');
+            clicked = true;
+            await Future.delayed(const Duration(milliseconds: 2200));
+          }
         }
 
-        // Nudge the page: the OTP list sometimes only loads when opened.
-        if (captured == null && ctl != null) {
-          await ctl!.evaluateJavascript(source: _clickMoreOtps);
-          await Future.delayed(const Duration(seconds: 3));
-          final raw = await ctl!.evaluateJavascript(
-              source: "JSON.stringify(window.__otpflow || [])");
-          try {
-            for (final e in (jsonDecode('$raw') as List<dynamic>)) {
-              final m = Map<String, dynamic>.from(e as Map);
-              final body = '${m['body'] ?? ''}';
-              if (m['status'] == 200 && body.isNotEmpty) {
-                final decoded = jsonDecode(body);
-                if (_looksLikeOtps(decoded)) {
-                  captured = decoded;
-                  log.writeln('  captured after opening "More OTPs"');
-                  break;
-                }
-              }
-            }
-          } catch (_) {}
+        // Anything the panel's own XHRs captured, for reference in diagnostics.
+        final hooked = await ctl?.evaluateJavascript(
+            source: "JSON.stringify((window.__otpflow || []).map(function(e){"
+                "return {url: e.url, status: e.status, req: (e.req||'').slice(0,200)};}))");
+        if (hooked != null && '$hooked'.length > 4) {
+          log.writeln('  panel XHRs: $hooked');
+        }
+
+        if (otps.isEmpty) {
+          log.writeln(pageReady
+              ? '  Returns page loaded and there are no pending OTPs right now'
+              : '  page never finished loading. page starts: $lastSample');
         }
 
         _record(log.toString());
         onCookies?.call(await dumpCookies());
 
-        if (captured == null) {
-          throw Exception('Panel did not return OTP data - see Settings, Session diagnostics');
+        // A page that rendered with nothing on it is a real answer, not a fault.
+        if (otps.isEmpty && !pageReady) {
+          throw Exception('Returns page did not load - see Settings, Session diagnostics');
         }
-        return PanelResult(otpData: captured, storeName: storeName);
+        return PanelResult(otpData: otps, storeName: storeName, pageReady: pageReady);
       } finally {
         await hw.dispose();
       }
     });
   }
 
-  static const _clickMoreOtps = "(function(){try{"
-      "var els=Array.prototype.slice.call(document.querySelectorAll('span,div,p,a,button'));"
-      "var m=els.filter(function(e){return /More OTPs/i.test(e.textContent)&&e.offsetParent!==null;})[0];"
-      "if(m){m.click();return 'clicked';}return 'not-found';"
-      "}catch(e){return 'err';}})();";
+  static const _clickMoreOtps = r'''
+(function(){try{
+  var els = Array.prototype.slice.call(document.querySelectorAll('span,div,p,a,button'));
+  var m = els.filter(function(e){ return /More OTPs/i.test(e.textContent) && e.offsetParent !== null; })[0];
+  if(m){ m.click(); return 'clicked'; }
+  return 'not-found';
+}catch(e){return 'err';}})();
+''';
 
   // =================================================================== login
   /// Logs in and returns the account's cookies plus its identifier.
@@ -554,10 +552,21 @@ class WebSession {
           await Future.delayed(const Duration(milliseconds: 1600));
           final cookies = await dumpCookies();
           final ident = identifierFromUrl(url);
-          log.writeln('landed on $url with ${cookies.length} cookie(s), identifier=$ident');
+
+          // The landing page is the panel home, which greets you by store name.
+          var name = '';
+          for (var tries = 0; tries < 5 && name.isEmpty; tries++) {
+            final n = await c.evaluateJavascript(source: storeNameJs);
+            final v = '${n ?? ''}'.trim();
+            if (looksLikeStoreName(v)) name = v;
+            if (name.isEmpty) await Future.delayed(const Duration(milliseconds: 900));
+          }
+
+          log.writeln('landed on $url with ${cookies.length} cookie(s), '
+              'identifier=$ident, store=${name.isEmpty ? "(not found)" : name}');
           _record(log.toString());
           if (cookies.isEmpty) throw Exception('Logged in but no cookies were set');
-          return LoginResult(cookies: cookies, identifier: ident);
+          return LoginResult(cookies: cookies, identifier: ident, storeName: name);
         }
 
         if (!filled) {
@@ -616,31 +625,50 @@ class WebSession {
       url.contains('/signin') ||
       RegExp(r'/root/?$').hasMatch(url);
 
-  /// JS that fills the Meesho login form and presses the button.
+  /// JS that fills the Meesho login form and presses the button. The literal
+  /// parts are raw strings; only the email and password are interpolated (as
+  /// JSON, so quotes and backslashes inside them are safe).
   static String fillScript(String email, String password) {
-    final e = jsonEncode(email);
-    final p = jsonEncode(password);
-    return "(function(){try{"
-        "var pass=document.querySelector('input[type=\"password\"]');"
-        "var mail=document.querySelector('input[name=\"emailOrPhone\"]')||document.querySelector('input[type=\"email\"]')||document.querySelector('input[type=\"text\"]');"
-        "if(!pass||!mail)return 'no-form';"
-        "function setVal(el,v){var s=Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype,'value').set;"
-        "s.call(el,v);el.dispatchEvent(new Event('input',{bubbles:true}));el.dispatchEvent(new Event('change',{bubbles:true}));}"
-        "mail.focus();setVal(mail,$e);pass.focus();setVal(pass,$p);"
-        "var btn=document.querySelector('button[type=\"submit\"]');"
-        "if(!btn){var all=Array.prototype.slice.call(document.querySelectorAll('button'));"
-        "btn=all.filter(function(b){return /log ?in|sign ?in/i.test(b.textContent);})[0];}"
-        "if(!btn)return 'no-button';"
-        "if(btn.disabled)return 'button-disabled';"
-        "btn.click();return 'submitted';"
-        "}catch(err){return 'error: '+err.message;}})();";
+    const head = r'''
+(function(){try{
+  var pass = document.querySelector('input[type="password"]');
+  var mail = document.querySelector('input[name="emailOrPhone"]')
+          || document.querySelector('input[type="email"]')
+          || document.querySelector('input[type="text"]');
+  if(!pass || !mail) return 'no-form';
+  function setVal(el, v){
+    var s = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+    s.call(el, v);
+    el.dispatchEvent(new Event('input', {bubbles:true}));
+    el.dispatchEvent(new Event('change', {bubbles:true}));
+  }
+  mail.focus(); setVal(mail, ''';
+    const mid = r''');
+  pass.focus(); setVal(pass, ''';
+    const tail = r''');
+  var btn = document.querySelector('button[type="submit"]');
+  if(!btn){
+    var all = Array.prototype.slice.call(document.querySelectorAll('button'));
+    btn = all.filter(function(b){ return /log ?in|sign ?in/i.test(b.textContent); })[0];
+  }
+  if(!btn) return 'no-button';
+  if(btn.disabled) return 'button-disabled';
+  btn.click();
+  return 'submitted';
+}catch(err){return 'error: ' + err.message;}})();
+''';
+    return head + jsonEncode(email) + mid + jsonEncode(password) + tail;
   }
 
   /// JS that reports what the login page is currently showing.
-  static const stateScript = "(function(){var t=(document.body.innerText||'').toLowerCase();"
-      "if(/invalid|incorrect|wrong password|not registered/.test(t))return 'wrong';"
-      "if(/enter otp|verification code|otp sent|captcha|verify/.test(t))return 'challenge';"
-      "return 'waiting';})();";
+  static const stateScript = r'''
+(function(){
+  var t = (document.body.innerText || '').toLowerCase();
+  if(/invalid|incorrect|wrong password|not registered/.test(t)) return 'wrong';
+  if(/enter otp|verification code|otp sent|captcha|verify/.test(t)) return 'challenge';
+  return 'waiting';
+})();
+''';
 }
 
 // ============================================================== login sheet
@@ -690,8 +718,17 @@ class _LoginSheetState extends State<_LoginSheet> {
         await Future.delayed(const Duration(milliseconds: 1600));
         final cookies = await WebSession.dumpCookies();
         final ident = WebSession.identifierFromUrl(url);
+        final n = await c.evaluateJavascript(source: WebSession.storeNameJs);
+        final name = '${n ?? ''}'.trim();
         _log.writeln('landed on $url with ${cookies.length} cookie(s), identifier=$ident');
-        _finish(LoginResult(cookies: cookies, identifier: ident), 'done');
+        _finish(
+          LoginResult(
+            cookies: cookies,
+            identifier: ident,
+            storeName: WebSession.looksLikeStoreName(name) ? name : '',
+          ),
+          'done',
+        );
         return;
       }
 
