@@ -233,21 +233,24 @@ class AppStore extends ChangeNotifier {
         if (a.identifier.isEmpty) throw SessionExpired();
       }
 
-      // The API is far quicker, so try it while it lasts. Meesho's WAF has
-      // started answering hand-made calls with an Akamai "Access Denied";
-      // once that happens we stop wasting a few seconds on it every refresh
-      // and read the Returns page instead.
+      // The panel sends exactly this body, so we send the same. Guessing at it
+      // earlier is what produced the 500s.
       dynamic data;
       var gotFromApi = false;
-      // Whether we actually managed to see the Returns page. Declared out here
-      // so the "nothing pending" check below can read it.
       var pageReady = false;
-      if (!apiBlocked) {
+
+      if (!apiBlocked && a.supplierId.isNotEmpty) {
         try {
           data = await WebSession.apiCall(
             a.cookies,
             '/api/fulfillment/returnRto/fetchDeliveryOTPs',
             identifier: a.identifier,
+            body: {
+              'supplier_id': int.tryParse(a.supplierId) ?? a.supplierId,
+              'identifier': a.identifier,
+              'child_supplier_identifier': null,
+              'child_supplier_id': null,
+            },
             onCookies: (c) {
               if (c.isNotEmpty) a.cookies = c;
             },
@@ -261,6 +264,9 @@ class AppStore extends ChangeNotifier {
       }
 
       if (!gotFromApi) {
+        // First run for this account, or the API is being refused: open the
+        // Returns page. That pass also hands back the supplier id and store
+        // name, so the next refresh can take the quick route.
         final panel = await WebSession.fetchOtpsViaPanel(
           a.cookies,
           a.identifier,
@@ -270,6 +276,7 @@ class AppStore extends ChangeNotifier {
         );
         data = panel.otpData;
         pageReady = panel.pageReady;
+        if (panel.supplierId.isNotEmpty) a.supplierId = panel.supplierId;
         if (panel.storeName.isNotEmpty && a.autoName) a.name = panel.storeName;
       }
 
