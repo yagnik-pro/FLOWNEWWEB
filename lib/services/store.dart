@@ -233,16 +233,15 @@ class AppStore extends ChangeNotifier {
         if (a.identifier.isEmpty) throw SessionExpired();
       }
 
-      // Let the panel build the request itself and just read what it got back.
-      // Hand-made calls to this endpoint return 500 - the payload it wants is
-      // not something worth guessing at. The same pass also picks up the store
-      // name straight off the page.
       // The API is far quicker, so try it while it lasts. Meesho's WAF has
       // started answering hand-made calls with an Akamai "Access Denied";
       // once that happens we stop wasting a few seconds on it every refresh
       // and read the Returns page instead.
       dynamic data;
       var gotFromApi = false;
+      // Whether we actually managed to see the Returns page. Declared out here
+      // so the "nothing pending" check below can read it.
+      var pageReady = false;
       if (!apiBlocked) {
         try {
           data = await WebSession.apiCall(
@@ -270,6 +269,7 @@ class AppStore extends ChangeNotifier {
           },
         );
         data = panel.otpData;
+        pageReady = panel.pageReady;
         if (panel.storeName.isNotEmpty && a.autoName) a.name = panel.storeName;
       }
 
@@ -279,7 +279,7 @@ class AppStore extends ChangeNotifier {
       // An empty list from a page that rendered fine just means nothing is
       // pending right now — that is an answer, not a failure.
       a.lastError = null;
-      if (a.otps.isEmpty && !panel.pageReady) {
+      if (a.otps.isEmpty && !gotFromApi && !pageReady) {
         MeeshoApi.lastRawResponse = WebSession.lastDebug;
         a.lastError = 'Could not read the Returns page - see Settings, Session diagnostics';
       }
