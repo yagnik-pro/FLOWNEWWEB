@@ -31,6 +31,12 @@ class SettingsScreen extends StatelessWidget {
                       children: [
                         const Text('Fetch new OTPs every',
                             style: TextStyle(fontWeight: FontWeight.w700, fontSize: 14.5)),
+                        const SizedBox(height: 4),
+                        const Text(
+                          'OTP Flow always checks once when you open the app. This is only for '
+                          'extra checks while it stays open.',
+                          style: TextStyle(color: AppColors.ink2, fontSize: 12.3, height: 1.35),
+                        ),
                         const SizedBox(height: 12),
                         Wrap(
                           spacing: 8, runSpacing: 8,
@@ -59,7 +65,8 @@ class SettingsScreen extends StatelessWidget {
                         ),
                         const SizedBox(height: 12),
                         const Text(
-                          'OTP Flow checks every account on this schedule and refreshes the list automatically.',
+                          'Leave it Off to save battery - a refresh still runs every time you open the app, '
+                          'and you can pull down or tap refresh any time.',
                           style: TextStyle(color: AppColors.ink2, fontSize: 12.5, height: 1.4),
                         ),
                       ],
