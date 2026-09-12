@@ -210,8 +210,10 @@ class _OtpScreenState extends State<OtpScreen> {
       return [
         FlowEmpty(
           icon: carriers.isEmpty ? Icons.local_shipping_outlined : Icons.search_off_rounded,
-          title: carriers.isEmpty ? 'No OTPs yet' : 'No matches',
-          body: carriers.isEmpty ? 'Pull down to refresh and fetch the latest return OTPs.' : 'Nothing matched "$_q".',
+          title: carriers.isEmpty ? 'Nothing to hand over' : 'No matches',
+          body: carriers.isEmpty
+              ? 'No courier has a pending return OTP right now. Pull down to check again.'
+              : 'Nothing matched "$_q".',
         )
       ];
     }
@@ -288,7 +290,7 @@ class _OtpScreenState extends State<OtpScreen> {
       case AccStatus.error:
         return const StatusPill('Error', bg: Color(0xFFFDECEA), fg: AppColors.danger);
       default:
-        return const StatusPill('No OTPs', bg: AppColors.mintSoft, fg: Color(0xFF1E7A4A));
+        return const StatusPill('No OTPs pending', bg: AppColors.mintSoft, fg: Color(0xFF1E7A4A));
     }
   }
 }
