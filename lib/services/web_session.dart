@@ -298,6 +298,58 @@ class WebSession {
         "}";
   }
 
+  // ============================================================= store name
+  /// Reads the store name straight off the panel. The API route for this keeps
+  /// returning 403, but the page shows the name in the sidebar header and in
+  /// the "Welcome back, X" greeting.
+  ///
+  /// Raw string so the JS regex `$` anchors and `\` escapes survive Dart.
+  static const storeNameJs = r'''
+(function(){try{
+  function ok(s){
+    if(!s) return false;
+    s = s.trim();
+    if(s.length < 2 || s.length > 60) return false;
+    var letters = s.replace(/[^A-Za-z\u0900-\u097F]/g, '');
+    if(letters.length < 2) return false;
+    if(/^[.\u2026\s\-_|]+$/.test(s)) return false;
+    if(/^(loading|undefined|null|menu|notices|support)$/i.test(s)) return false;
+    return true;
+  }
+  var t = document.body.innerText || '';
+  var m = t.match(/Welcome back,\s*([^\n]{2,60})/i);
+  if(m && ok(m[1])) return m[1].trim();
+
+  var sels = ['aside', 'nav', '[class*="sidebar" i]', '[class*="Sidebar" i]', 'header'];
+  for(var i = 0; i < sels.length; i++){
+    var el = document.querySelector(sels[i]);
+    if(!el) continue;
+    var lines = (el.innerText || '').split('\n');
+    for(var j = 0; j < lines.length; j++){
+      var L = lines[j].trim();
+      if(/notice|support|^home$|^orders?$|^returns?$|pricing|claim|inventory|catalog|quality|payment|warehouse|service|menu|advertis|promotion|influencer|instant cash|pay later/i.test(L)) continue;
+      if(ok(L)) return L;
+    }
+  }
+  for(var k = 0; k < localStorage.length; k++){
+    var v = localStorage.getItem(localStorage.key(k)) || '';
+    var n = v.match(/"(?:supplier_name|business_name|shop_name|store_name|name)"\s*:\s*"([^"]{2,60})"/);
+    if(n && ok(n[1])) return n[1];
+  }
+  return '';
+}catch(e){return '';}})();
+''';
+
+  /// Same validation on the Dart side, so nothing odd reaches the UI.
+  static bool looksLikeStoreName(String s) {
+    final v = s.trim();
+    if (v.length < 2 || v.length > 60) return false;
+    final lower = v.toLowerCase();
+    if (lower == 'null' || lower == 'undefined') return false;
+    final letters = RegExp(r'[A-Za-z\u0900-\u097F]').allMatches(v).length;
+    return letters >= 2;
+  }
+
   // ======================================================= panel interception
   /// Injected before any page script runs. It wraps `fetch` and
   /// `XMLHttpRequest` so every returns-related call the panel makes — request
