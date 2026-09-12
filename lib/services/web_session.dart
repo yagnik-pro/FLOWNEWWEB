@@ -34,10 +34,15 @@ class PanelResult {
   /// means there simply are no OTPs pending — not that anything failed.
   final bool pageReady;
 
+  /// Numeric supplier id, lifted out of the request the panel itself sends.
+  /// With it we can call the API directly and skip loading the page at all.
+  final String supplierId;
+
   const PanelResult({
     required this.otpData,
     required this.storeName,
     this.pageReady = false,
+    this.supplierId = '',
   });
 }
 
@@ -306,19 +311,22 @@ class WebSession {
   /// Raw string so the JS regex `$` anchors and `\` escapes survive Dart.
   static const storeNameJs = r'''
 (function(){try{
+  function clean(s){
+    return (s || '').trim().replace(/^[\s|:>-]+/, '').replace(/[\s|:<>!.,;-]+$/, '').trim();
+  }
   function ok(s){
     if(!s) return false;
-    s = s.trim();
     if(s.length < 2 || s.length > 60) return false;
     var letters = s.replace(/[^A-Za-z\u0900-\u097F]/g, '');
     if(letters.length < 2) return false;
-    if(/^[.\u2026\s\-_|]+$/.test(s)) return false;
-    if(/^(loading|undefined|null|menu|notices|support)$/i.test(s)) return false;
+    if(/^(loading|undefined|null|menu|notices|support|home|dashboard)$/i.test(s)) return false;
+    // Error objects and toasts render as text too - never take those as a name.
+    if(/error|exception|axios|failed|something went wrong|try again|network/i.test(s)) return false;
     return true;
   }
   var t = document.body.innerText || '';
   var m = t.match(/Welcome back,\s*([^\n]{2,60})/i);
-  if(m && ok(m[1])) return m[1].trim();
+  if(m){ var w = clean(m[1]); if(ok(w)) return w; }
 
   var sels = ['aside', 'nav', '[class*="sidebar" i]', '[class*="Sidebar" i]', 'header'];
   for(var i = 0; i < sels.length; i++){
@@ -326,15 +334,15 @@ class WebSession {
     if(!el) continue;
     var lines = (el.innerText || '').split('\n');
     for(var j = 0; j < lines.length; j++){
-      var L = lines[j].trim();
+      var L = clean(lines[j]);
       if(/notice|support|^home$|^orders?$|^returns?$|pricing|claim|inventory|catalog|quality|payment|warehouse|service|menu|advertis|promotion|influencer|instant cash|pay later/i.test(L)) continue;
       if(ok(L)) return L;
     }
   }
   for(var k = 0; k < localStorage.length; k++){
     var v = localStorage.getItem(localStorage.key(k)) || '';
-    var n = v.match(/"(?:supplier_name|business_name|shop_name|store_name|name)"\s*:\s*"([^"]{2,60})"/);
-    if(n && ok(n[1])) return n[1];
+    var n = v.match(/"(?:supplier_name|business_name|shop_name|store_name)"\s*:\s*"([^"]{2,60})"/);
+    if(n){ var c = clean(n[1]); if(ok(c)) return c; }
   }
   return '';
 }catch(e){return '';}})();
@@ -342,13 +350,27 @@ class WebSession {
 
   /// Same validation on the Dart side, so nothing odd reaches the UI.
   static bool looksLikeStoreName(String s) {
-    final v = s.trim();
+    final v = cleanStoreName(s);
     if (v.length < 2 || v.length > 60) return false;
     final lower = v.toLowerCase();
-    if (lower == 'null' || lower == 'undefined') return false;
+    if (lower == 'null' || lower == 'undefined' || lower == 'loading') return false;
+    // A rendered error object is not a shop name.
+    if (RegExp(r'error|exception|axios|failed|something went wrong|network',
+            caseSensitive: false)
+        .hasMatch(v)) {
+      return false;
+    }
     final letters = RegExp(r'[A-Za-z\u0900-\u097F]').allMatches(v).length;
     return letters >= 2;
   }
+
+  /// Trims the stray punctuation the panel sometimes renders around the name,
+  /// e.g. "VastraRivaz!" -> "VastraRivaz".
+  static String cleanStoreName(String s) => s
+      .trim()
+      .replaceAll(RegExp(r'^[\s|:>-]+'), '')
+      .replaceAll(RegExp(r'[\s|:<>!.,;-]+$'), '')
+      .trim();
 
   // ======================================================= panel interception
   /// Injected before any page script runs. It wraps `fetch` and
@@ -475,7 +497,7 @@ class WebSession {
 
           if (storeName.isEmpty) {
             final n = await c.evaluateJavascript(source: storeNameJs);
-            final v = '${n ?? ''}'.trim();
+            final v = cleanStoreName('${n ?? ''}');
             if (looksLikeStoreName(v)) {
               storeName = v;
               log.writeln('  store name from page: $storeName');
@@ -521,8 +543,15 @@ class WebSession {
         final hooked = await ctl?.evaluateJavascript(
             source: "JSON.stringify((window.__otpflow || []).map(function(e){"
                 "return {url: e.url, status: e.status, req: (e.req||'').slice(0,200)};}))");
+        var supplierId = '';
         if (hooked != null && '$hooked'.length > 4) {
           log.writeln('  panel XHRs: $hooked');
+          // "supplier_id\":2671903  ->  2671903 (the \": between is just JSON escaping)
+          final m = RegExp(r'supplier_id\D{0,6}(\d{4,10})').firstMatch('$hooked');
+          if (m != null) {
+            supplierId = m.group(1)!;
+            log.writeln('  supplier_id from panel: $supplierId');
+          }
         }
 
         if (otps.isEmpty) {
@@ -538,7 +567,12 @@ class WebSession {
         if (otps.isEmpty && !pageReady) {
           throw Exception('Returns page did not load - see Settings, Session diagnostics');
         }
-        return PanelResult(otpData: otps, storeName: storeName, pageReady: pageReady);
+        return PanelResult(
+          otpData: otps,
+          storeName: storeName,
+          pageReady: pageReady,
+          supplierId: supplierId,
+        );
       } finally {
         await hw.dispose();
       }
@@ -609,7 +643,7 @@ class WebSession {
           var name = '';
           for (var tries = 0; tries < 5 && name.isEmpty; tries++) {
             final n = await c.evaluateJavascript(source: storeNameJs);
-            final v = '${n ?? ''}'.trim();
+            final v = cleanStoreName('${n ?? ''}');
             if (looksLikeStoreName(v)) name = v;
             if (name.isEmpty) await Future.delayed(const Duration(milliseconds: 900));
           }
@@ -771,7 +805,7 @@ class _LoginSheetState extends State<_LoginSheet> {
         final cookies = await WebSession.dumpCookies();
         final ident = WebSession.identifierFromUrl(url);
         final n = await c.evaluateJavascript(source: WebSession.storeNameJs);
-        final name = '${n ?? ''}'.trim();
+        final name = WebSession.cleanStoreName('${n ?? ''}');
         _log.writeln('landed on $url with ${cookies.length} cookie(s), identifier=$ident');
         _finish(
           LoginResult(
