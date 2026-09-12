@@ -17,7 +17,8 @@ class AppStore extends ChangeNotifier {
   static const _kBg = 'otpflow.background';
 
   final List<Account> accounts = [];
-  int intervalMin = 5;
+  /// 0 = only when the app opens or you tap refresh.
+  int intervalMin = 0;
   bool notifyOnNew = true;
   bool backgroundEnabled = true;
 
@@ -40,7 +41,7 @@ class AppStore extends ChangeNotifier {
           ..addAll((jsonDecode(raw) as List).map((e) => Account.fromJson(Map<String, dynamic>.from(e))));
       } catch (_) {}
     }
-    intervalMin = p.getInt(_kInterval) ?? 5;
+    intervalMin = p.getInt(_kInterval) ?? 0;
     notifyOnNew = p.getBool(_kNotify) ?? true;
     backgroundEnabled = p.getBool(_kBg) ?? true;
     for (final a in accounts) {
@@ -152,31 +153,60 @@ class AppStore extends ChangeNotifier {
   }
 
   /// Fetch OTPs for every account (auto re-login if the session died).
+  /// Fetches every account once. Waits briefly if a pass is already running,
+  /// so a tap right after opening the app isn't silently swallowed.
   Future<void> refreshAll({bool silent = false}) async {
-    if (busy || accounts.isEmpty) return;
+    if (accounts.isEmpty) return;
+    for (var i = 0; i < 60 && busy; i++) {
+      await Future.delayed(const Duration(milliseconds: 500));
+    }
+    if (busy) return;
     busy = true;
     busyLabel = 'Refreshing…';
     if (!silent) notifyListeners();
     final before = {for (final a in accounts) a.id: a.otps.map((o) => o.key).toSet()};
-    await _parallel(List.of(accounts), (a) => _fetchOne(a));
-    await _save();
-    busy = false;
-    busyLabel = null;
-    notifyListeners();
+    try {
+      await _parallel(List.of(accounts), (a) => _fetchOne(a));
+      await _save();
+    } finally {
+      busy = false;
+      busyLabel = null;
+      _settleStuck();
+      notifyListeners();
+    }
     if (notifyOnNew) _notifyNew(before);
   }
 
+  /// Nothing should be left spinning once a pass is over.
+  void _settleStuck() {
+    for (final a in accounts) {
+      if (a.status == AccStatus.working) {
+        a.status = a.otps.isNotEmpty ? AccStatus.ok : AccStatus.error;
+        a.lastError ??= 'Timed out - tap refresh to try again';
+      }
+    }
+  }
+
   Future<void> refreshOne(Account a) async {
+    // Wait for an in-flight sweep instead of silently doing nothing - a tap
+    // that appears to do nothing is worse than a short wait.
+    for (var i = 0; i < 60 && busy; i++) {
+      await Future.delayed(const Duration(milliseconds: 500));
+    }
     if (busy) return;
     busy = true;
     busyLabel = 'Refreshing ${a.name}…';
     notifyListeners();
     final before = {a.id: a.otps.map((o) => o.key).toSet()};
-    await _fetchOne(a);
-    await _save();
-    busy = false;
-    busyLabel = null;
-    notifyListeners();
+    try {
+      await _fetchOne(a);
+      await _save();
+    } finally {
+      busy = false;
+      busyLabel = null;
+      _settleStuck();
+      notifyListeners();
+    }
     if (notifyOnNew) _notifyNew(before);
   }
 
@@ -187,7 +217,16 @@ class AppStore extends ChangeNotifier {
     Future<void> worker() async {
       while (queue.isNotEmpty) {
         final a = queue.removeAt(0);
-        try { await fn(a); } catch (_) {}
+        try {
+          await fn(a);
+        } catch (e) {
+          a.lastError = e.toString().replaceFirst('Exception: ', '');
+        } finally {
+          // A row stuck on "working" spins forever; make sure it always lands.
+          if (a.status == AccStatus.working) {
+            a.status = a.lastError == null ? AccStatus.ok : AccStatus.error;
+          }
+        }
         notifyListeners();
       }
     }
@@ -215,7 +254,17 @@ class AppStore extends ChangeNotifier {
     }
   }
 
-  Future<void> _fetchOne(Account a, {bool allowRelogin = true}) async {
+  Future<void> _fetchOne(Account a, {bool allowRelogin = true}) {
+    // A hung WebView used to leave the account spinning forever and, because
+    // the shared lock never released, block every other account too.
+    return _fetchOneInner(a, allowRelogin: allowRelogin)
+        .timeout(const Duration(seconds: 75), onTimeout: () {
+      a.status = AccStatus.error;
+      a.lastError = 'Timed out - tap refresh to try again';
+    });
+  }
+
+  Future<void> _fetchOneInner(Account a, {bool allowRelogin = true}) async {
     a.status = AccStatus.working;
     notifyListeners();
     try {
@@ -259,7 +308,10 @@ class AppStore extends ChangeNotifier {
         } on SessionExpired {
           rethrow;
         } catch (_) {
-          apiBlocked = true;
+          // Only fall back for good: a one-off hiccup shouldn't cost every
+          // later refresh the slow page load.
+          final d = WebSession.lastDebug ?? '';
+          apiBlocked = d.contains('Access Denied') || d.contains('HTTP 403');
         }
       }
 
@@ -298,7 +350,8 @@ class AppStore extends ChangeNotifier {
       if (allowRelogin) {
         final err = await _loginOne(a);
         if (err == null) {
-          await _fetchOne(a, allowRelogin: false);
+          // Inner, not the wrapper - the outer timeout already covers this.
+          await _fetchOneInner(a, allowRelogin: false);
           return;
         }
         a.status = AccStatus.needsLogin;
